@@ -2083,8 +2083,34 @@ impl<'a> Lower<'a> {
         if !every {
             if halves {
                 need(self.cur_ir);
+                return Err(WHERE);
             }
-            return Err(WHERE);
+            // Not every lane runs: the console's wave sums the lanes that do,
+            // in an order this host's wave sum need not share (the tree
+            // below reads a partner in every lane, active or not). The host
+            // sums the terms in f32 and the total is rounded once to 16 bits:
+            // within the last place of the console's, where refusing the
+            // shader cost its whole pass (2026-11-25, five compute shaders of
+            // the title, GFX10 code at 0x22c).
+            let c = self.cur;
+            let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
+            let f32t = self.s.t.f32;
+            let term = self.s.m.bin(c, Bin::And, x, low);
+            let term = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[term]);
+            let (k0, ku) = (self.s.m.i8(0), self.s.m.i8(0));
+            let total = self
+                .s
+                .op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[term, k0, ku]);
+            let sum = self.f16_nearest(total);
+            let c = self.cur;
+            let sum = self.s.m.bin(c, Bin::And, sum, low);
+            // The high half is the first lane's (lane 0 on the console; the
+            // first lane running here may be another).
+            let first = self
+                .s
+                .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, self.s.t.i32, 118, &[x]);
+            let first = self.s.m.bin(c, Bin::And, first, high);
+            return Ok(self.s.m.bin(c, Bin::Or, first, sum));
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
