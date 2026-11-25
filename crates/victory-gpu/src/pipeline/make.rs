@@ -44,13 +44,6 @@ unsafe impl Sync for Pending {}
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
-        // The host pipeline library keeps a pipeline under this name, and D3D12
-        // hands it back without looking at what it was built from. Without our
-        // build in the name, a rebuilt translator's pipelines would never take
-        // the place of the ones the old translator stored - every fix would be
-        // silently ignored for any shader already in the library. This is the
-        // same key the translations themselves are cached under.
-        key.update(crate::shader_cache::build());
         for s in &shaders {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
