@@ -786,11 +786,11 @@ impl State {
                 once!(kind, "a shader reads a host value this build does not know");
                 return 0;
             }
-            // The console's NUM_RECORDS: the view's length less one.
+            // The console's NUM_RECORDS: the view's records less one.
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                    .and_then(|view| crate::descriptor::host::buffer_range(&view))
-                    .map_or(0, |range| (range.1.saturating_sub(1)).min(u64::from(u32::MAX)) as u32),
+                    .and_then(|view| crate::descriptor::host::buffer_records(&view))
+                    .map_or(0, |records| (records.saturating_sub(1)).min(u64::from(u32::MAX)) as u32),
                 _ => 0,
             };
         }
