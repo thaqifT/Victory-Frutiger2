@@ -377,6 +377,13 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// The wait between looks once [`RECHECK_FRAMES`] runs out. Not never: a
+/// texture whose memory is still filling when the table ends (a streamed
+/// one whose pages arrive over a minute) kept what it held at the last look
+/// for the rest of the run - a smeared or blocky surface that never healed.
+/// The look is a fingerprint of 48 KiB, some 175 slots a frame.
+const RECHECK_FOREVER_FRAMES: u64 = 200;
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -1926,7 +1933,17 @@ impl State {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        // Past the table the look goes on at one wait: the
+                        // slot is never closed for good.
+                        None => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + RECHECK_FOREVER_FRAMES,
+                            (at, len),
+                            print,
+                            looks,
+                            uploaded,
+                        ),
                     }
                     continue;
                 }
