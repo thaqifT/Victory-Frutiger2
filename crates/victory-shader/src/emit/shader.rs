@@ -72,6 +72,13 @@ pub const USER_MEMORY_BASE: u32 = 0x100;
 /// descriptor and uses it as a pointer.)
 pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// `RootType::Other` code of a user-data dword the host computes: the
+/// number of records of the buffer view at dword `dword` of the descriptor
+/// table of root parameter `slot`, less one — the console's V# `NUM_RECORDS`
+/// (dword 2 of the descriptor). A program that only takes a buffer view's
+/// address has no handle to ask the size of, and one that walks a buffer by
+/// its address bounds the walk with this dword.
+pub const USER_VIEW_SIZE: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the
 /// bytes (0 to 15) by which the raw view the host binds for the root view
 /// of root parameter `slot` begins before the title's address. A raw view
 /// begins on 16 bytes of its host buffer; the console's root views begin

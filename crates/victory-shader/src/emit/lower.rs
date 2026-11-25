@@ -2687,10 +2687,11 @@ impl<'a> Lower<'a> {
     /// The title address (low dword, bits from 32 up) of the buffer view
     /// whose descriptor the scalar load at `site` reads from the start of
     /// a table entry, as the host tells it when it binds (`shader.rs`
-    /// `USER_VIEW_ADDRESS`); none for anything else. (The console's
-    /// descriptor holds more in the second dword, the stride from bit 16
-    /// up; code that takes the address masks those away.)
-    fn view_address(&mut self, site: Site) -> Option<(V, V)> {
+    /// `USER_VIEW_ADDRESS`), with the root parameter and dword they are
+    /// asked for by; none for anything else. (The console's descriptor holds
+    /// more in the second dword, the stride from bit 16 up; code that takes
+    /// the address masks those away.)
+    fn view_address(&mut self, site: Site) -> Option<(V, V, u8, u32)> {
         use super::shader::USER_VIEW_ADDRESS;
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
@@ -2714,7 +2715,7 @@ impl<'a> Lower<'a> {
         }
         let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
         let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
-        Some((lo, hi))
+        Some((lo, hi, rp.slot, dword))
     }
 
     /// [`view_address`] for a table entry chosen at run time (a computed
@@ -5735,19 +5736,21 @@ impl<'a> Lower<'a> {
             // chosen at run time asks the host's table of view addresses;
             // one load may carry two descriptors (8 dwords).
             if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
+                && let Some((lo, hi, slot, dword)) = self.view_address(site)
             {
+                use super::shader::USER_VIEW_SIZE;
+                let size = self.host_word(RootType::Other(USER_VIEW_SIZE), slot, dword);
+                // The format dword of a raw view carries no format.
+                let none = self.s.m.i32(0);
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
                     match k {
                         0 => self.write(inst, reg, lo, None),
                         1 => self.write(inst, reg, hi, None),
-                        _ => {
-                            if let Some(v) = inst.write(reg) {
-                                self.vals.insert(v, Val::Missing(OTHER));
-                                self.stale.insert(v);
-                            }
-                        }
+                        // The console's NUM_RECORDS: a walk of the memory
+                        // behind the view bounds itself with it.
+                        2 => self.write(inst, reg, size, None),
+                        _ => self.write(inst, reg, none, None),
                     }
                 }
                 return Ok(());
@@ -5907,14 +5910,16 @@ impl<'a> Lower<'a> {
                 });
                 if first == 0
                     && computed
-                    && let Some((lo, hi)) = self.view_address(site).or_else(|| {
+                    && let Some((lo, hi, slot, dword)) = self.view_address(site).or_else(|| {
                         self.view_address_indexed(site, 0)
                             .ok()
                             .flatten()
-                            .map(|(lo, hi, _, _)| (lo, hi))
+                            .map(|(lo, hi, _, _)| (lo, hi, 0, 0))
                     })
                 {
-                    words.extend([(0, lo), (1, hi)]);
+                    use super::shader::USER_VIEW_SIZE;
+                    let size = self.host_word(RootType::Other(USER_VIEW_SIZE), slot, dword);
+                    words.extend([(0, lo), (1, hi), (2, size)]);
                 }
                 words
             }
