@@ -1822,6 +1822,10 @@ fn fit_buffer_view(
     let elements = (width / element).max(1);
     let at = first.min(elements - 1);
     let n = u64::from(count.max(1)).min(elements - at);
+    // A raw view names R32_TYPELESS and nothing else: the host removes the
+    // device for another format (2026-11-25, run 5: format=39 raw=true
+    // ended the run). The shader's own type reads the dwords.
+    let format = if raw { DXGI_FORMAT_R32_TYPELESS } else { format };
     u32::try_from(n).ok().map(|n| (format, at, n, 0, raw))
 }
 
@@ -1892,6 +1896,11 @@ fn buffer_srv(
         } else {
             D3D12_BUFFER_SRV_FLAGS(0)
         };
+        // The fitted view must be one the host takes: creating one it refuses
+        // removes the device (2026-11-25, run 5).
+        if !buffer_view_ok(fit_format, fit_first, fit_count, fit_stride, fit_raw, width) {
+            return None;
+        }
     }
     // The console has no component mapping; one the host does not know is the default's.
     if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
@@ -1984,6 +1993,9 @@ fn buffer_uav(
             buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         } else {
             buffer.Flags = D3D12_BUFFER_UAV_FLAGS(0);
+        }
+        if !buffer_view_ok(fit_format, fit_first, fit_count, fit_stride, fit_raw, width) {
+            return None;
         }
     }
     let host = host()?;
