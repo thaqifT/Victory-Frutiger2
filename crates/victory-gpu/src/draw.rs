@@ -1402,7 +1402,7 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1448,9 +1448,27 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        // A slot that still names the view it named last pass is left as it
+        // is, except on its turn for the slow path: one `full`th of the
+        // slots each pass, rotating. A view of a resource the title
+        // released keeps its key while `view_at` stops answering for it, so
+        // the slow path has to come round: `full` passes, as before, but
+        // 1/`full` of the slots at a time instead of all of them every
+        // `full` passes. The sweep was 29 ms of a 176 ms frame over 16,156
+        // slots, 1.8 us each, almost all of them unchanged
+        // (2026-11-25, run 13).
+        let slow_at = (*passes as usize) % full as usize;
         for (n, &index) in slots.iter().enumerate() {
+            let handle = heap.handle(index);
+            if n % full as usize != slow_at
+                && let Some(handle) = handle
+                && let Some(key) = crate::descriptor::slot_key(handle)
+                && ranges.get(&index).is_some_and(|r| r.3 == key)
+            {
+                continue;
+            }
             ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
+            let Some(handle) = handle else {
                 continue;
             };
             let Some(view) = host.mirror(index, handle, true) else {
@@ -1480,7 +1498,7 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            ranges.insert(index, (shadow, address, address + len, crate::descriptor::slot_key(handle).unwrap_or(0)));
         }
         let views = ranges.len() as u32;
         let slot_us = slots_phase.elapsed().as_micros() as u64;
@@ -1488,7 +1506,7 @@ impl State {
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
+        for (shadow, from, to, _) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
             span.1 = span.1.min(*from);
@@ -1741,9 +1759,12 @@ impl State {
     /// shortcut: uploaded once, and again only when the title rewrites the
     /// slot. A placed texture not all mapped yet is uploaded with what is
     /// there and looked at again (1, 2, 4, ... frames later, at most about
-    /// a second): uploaded again when more of it is mapped. Pages mapped
-    /// in place of others, and contents changed with no descriptor write,
-    /// are missed (hook the page-mapping events for those).
+    /// a second): uploaded again when more of it is mapped. One with none of
+    /// its memory there yet is looked at again every
+    /// `VICTORY_TEXTURE_AWAY_FRAMES` (2) frames: its pages arriving late is
+    /// the ordinary case, and the doubling spent seconds on each. Pages
+    /// mapped in place of others, and contents changed with no descriptor
+    /// write, are missed (hook the page-mapping events for those).
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
     fn heap_textures(
         &self,
@@ -1799,16 +1820,24 @@ impl State {
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
         Self::card_accounting(heap, host, frame, room);
-        // The frames in about four seconds, between 16 and 256: how long a
-        // slot with nothing to upload waits at most for its next look. In
-        // frames alone it was 120: four minutes at the opening cutscene's
-        // half a frame per second, while the title streams by the clock.
-        // (About a second before the runtime told of the memory it maps:
-        // the looks are now only for what that does not tell.)
+        // How long a slot whose memory is not mapped waits for its next
+        // look: in frames, not the doubling `later` gives. A texture whose
+        // view the title writes before its pages arrive spent the rest of
+        // the run at the doubling's ceiling, which is seconds of black
+        // surface on any card slower than the console
+        // (`VICTORY_TEXTURE_AWAY_FRAMES`, 2).
+        static AWAY_FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let away = *AWAY_FRAMES.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_AWAY_FRAMES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(2, |n| n.clamp(1, 60))
+        });
+        let away_frames = || away;
+        // The frame's own length, for the pass's share of it (`span`).
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -1847,7 +1876,6 @@ impl State {
         let per_frame = if catchup && due.len() >= 1024 { per_frame * 3 } else { per_frame };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
-        // (Not `most`: that is the longest wait between looks, used below.)
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
             Some((ms, bytes)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
@@ -1911,13 +1939,17 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
-                    host.texture_slot_later(index, write, frame, most);
+                    host.texture_slot_away(index, write, frame, away_frames());
                     continue;
                 }
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most);
+                        // No more of it than last time: nothing arrived, so
+                        // this is the same wait as a texture not there at
+                        // all, not the doubling of a slot with something new
+                        // to upload.
+                        host.texture_slot_away(index, write, frame, away_frames());
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {

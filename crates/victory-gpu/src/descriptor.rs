@@ -745,6 +745,18 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     view_at(i, generation)
 }
 
+/// The key a descriptor slot names, as [`view`] reads it, without the
+/// lookup: `None` if the title never wrote one of ours there.
+///
+/// The pass over a heap's buffer views asks this of every slot before it
+/// asks for the view itself: 16,156 slots a pass were 29 ms, and most of
+/// them name the view they named last pass (`draw::State::heap_buffers`).
+pub(crate) fn slot_key(handle: u64) -> Option<u64> {
+    // SAFETY: the handle is a descriptor slot in title memory.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (tag == VIEW_TAG).then(|| u64::from(generation) << 32 | u64::from(i))
+}
+
 /// A description of `N` words, if the title passes one.
 fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     // SAFETY: the title passes a description or null.

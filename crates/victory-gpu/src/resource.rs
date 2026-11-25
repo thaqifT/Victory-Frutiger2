@@ -1386,11 +1386,18 @@ pub(crate) fn room() -> bool {
 
 /// The share of the card's budget, in percent, up to which host copies of
 /// textures picked by index are made ([`room`]): 90 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 99). At 90 about a
 /// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
 /// textures wait (runs 170-174); the card copies of title buffers from
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
 /// and 94 gives the textures about that much back.
+///
+/// The clamp used to stop at 97, which is where the gate closed with 13,391
+/// texture slots in the queue and 8,669 of them never uploaded at all
+/// (2026-11-25, run 16): the line is the wrong place to be thrifty when the
+/// surfaces on screen are the ones waiting. Past the line the system moves
+/// the card's memory into the PC's, which is the run-ending failure this
+/// guard exists for, so the line stays below the budget and the clamp at 99.
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1398,7 +1405,7 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(90, |percent| percent.clamp(50, 99))
     })
 }
 

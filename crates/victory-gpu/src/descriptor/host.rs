@@ -500,12 +500,20 @@ impl TextureQueue {
         }
     }
 
-    /// Nothing to upload at slot `index` now: looked at again after 1, 2,
-    /// 4, ... frames, at most `most`.
-    fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
+    /// Slot `index` has none of its memory mapped, or none more than last
+    /// look: looked at again after `wait` frames, the same wait every time.
+    ///
+    /// This was a doubling from the first look (1, 2, 4, ... frames, capped
+    /// at about four seconds). A texture whose view the title wrote long
+    /// before it streamed the memory in had already reached that cap by the
+    /// time the pages arrived, and stayed there for the rest of the run:
+    /// 8,669 slots of 13,391 sat in exactly that state (2026-11-25, run 16),
+    /// every one of them a black surface. The look that finds nothing is a
+    /// page query, not an upload: it costs no bytes.
+    fn away(&mut self, index: u32, write: u64, frame: u64, wait: u64) {
         if let Some(mut w) = self.same(index, write) {
-            w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
-            w.looks = w.looks.saturating_add(1);
+            w.due = frame + wait.max(1);
+            w.looks = w.looks.max(1);
             self.set(index, Some(w));
         }
     }
@@ -1058,12 +1066,11 @@ impl HostHeap {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
     }
 
-    /// Nothing to upload at title slot `index` now (its memory is not
-    /// mapped, or no more of it than before): looked at again after 1, 2,
-    /// 4, ... frames, at most `most`.
-    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
+    /// Title slot `index` has none of its memory mapped, or no more of it
+    /// than last look: see [`TextureQueue::away`].
+    pub(crate) fn texture_slot_away(&self, index: u32, write: u64, frame: u64, wait: u64) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.later(index, write, frame, most);
+        textures.away(index, write, frame, wait);
     }
 
     /// Bytes of title slot `index`'s memory that were mapped when it was
@@ -2699,9 +2706,9 @@ mod tests {
 
     /// The queue of textures picked by index serves the slots looked at
     /// before first, then the newest write and the oldest in turns; a
-    /// slot whose memory is not there is looked at again after
-    /// 1, 2, 4 frames up to the limit; and what the pass reports about a
-    /// slot written again meanwhile is dropped.
+    /// slot whose memory is not there is looked at again every 2 frames;
+    /// and what the pass reports about a slot written again meanwhile is
+    /// dropped.
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();
@@ -2715,12 +2722,13 @@ mod tests {
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
         assert_eq!(q.due(9, 2).len(), 2);
         assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
-        // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
+        // Slot 17's memory is not mapped: again in 2 frames, the same wait
+        // every time (it used to double: 1, 2, 4, then the limit).
         let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
         let mut frame = 9;
-        for wait in [1, 2, 4, 4] {
-            q.later(17, w17, frame, 4);
+        for wait in [2, 2, 2, 2] {
+            q.away(17, w17, frame, 2);
             assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
             frame += wait;
             // Due again, and ahead of every slot never looked at.
@@ -2738,7 +2746,7 @@ mod tests {
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
-        q.later(16, w16, 13, 4);
+        q.away(16, w16, 13, 2);
         assert_eq!(q.mapped(16), 0);
         assert_eq!(q.due(13, 100)[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
