@@ -1,4 +1,4 @@
-﻿//! The PC container around emitted DXIL: feature flags (`SFI0`), the
+//! The PC container around emitted DXIL: feature flags (`SFI0`), the
 //! signatures (`ISG1`, `OSG1`), pipeline state validation (`PSV0`) and the
 //! program (`DXIL`), laid out as validator version 1.6 lays them out, plus
 //! the container hash that D3D12 checks.
