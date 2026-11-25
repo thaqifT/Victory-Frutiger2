@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -37,6 +37,17 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// How many pages of `copied` are still 0 (never copied). While none is,
+    /// a refresh need look only at the pages the journal names: walking
+    /// every page of every range instead was 2.4 million page looks a frame
+    /// (9.9 GB of ranges refreshed, 137 MB of them changed: run `res`).
+    zeros: AtomicUsize,
+    /// The standing asking and our own write count under which `[from, to)`
+    /// was last refreshed, and that range: a refresh of a range the first
+    /// covered, under the same pair, has nothing to copy — the journal's
+    /// answer for it cannot have changed (run `direct`: 19,875 refreshes a
+    /// frame over 17.4 GB, 98.7% of the bytes checked unchanged).
+    settled: Mutex<(u64, u64, usize, usize)>,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -77,6 +88,24 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+}
+
+/// Whether a refresh of write-watched title memory reads it with a plain
+/// `memcpy` instead of the kernel's copy (`VICTORY_COPY_DIRECT=0` asks the
+/// kernel, as before; `VICTORY_COPY_MODE` overrides this for a timing run).
+///
+/// The kernel's copy costs 1.4 µs a call whatever the bytes: the gameplay
+/// frame of run `res` made 17,792 of them for 97 MB, 5.5 KB each, 25 ms.
+/// A `memcpy` of the same bytes costs 0.1-0.2 µs. What makes it safe is
+/// that `GetWriteWatch` answers only for pages that are committed and in
+/// one reservation (`crate::watch::writes`' third value): such a buffer
+/// lives as long as the title keeps it, and the title frees none of them
+/// while it has lists that read them. View memory (the title's streamed
+/// pages, which come and go) is guarded instead and still read through the
+/// kernel, as textures are.
+fn direct_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_DIRECT").is_none_or(|v| v != "0"))
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1719,6 +1748,8 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
+            zeros: AtomicUsize::new(pages as usize),
+            settled: Mutex::new((0, 0, 0, 0)),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -1963,7 +1994,7 @@ impl Shadow {
                 }
                 if differs != 0 {
                     crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n, self.watched.load(Ordering::Relaxed) == 1);
                     written += n;
                 }
             }
@@ -2052,7 +2083,7 @@ impl Shadow {
             return 0;
         }
         crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n, self.watched.load(Ordering::Relaxed) == 1);
         n
     }
 
@@ -2273,7 +2304,7 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some((now, written, _)) = crate::watch::writes(a, e, true) else {
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2347,6 +2378,9 @@ impl Shadow {
                 if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(at) = copied.get_mut(page - base) {
+                        if *at == 0 {
+                            self.zeros.fetch_sub(1, Ordering::Relaxed);
+                        }
                         *at = now;
                     }
                 }
@@ -2399,11 +2433,33 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // Refreshed already under this submission's one asking, over a range
+        // that covers this one: the journal's answer is the one it gave, and
+        // we have written nothing since (our own writes are counted).
+        if let Some((asking, own)) = crate::watch::standing() {
+            let settled = self.settled.lock().unwrap_or_else(|e| e.into_inner());
+            if settled.0 == asking && settled.1 == own && settled.2 <= from && to <= settled.3 {
+                drop(settled);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Settled, 1);
+                    add(C::SettledBytes, (to - from) as u64);
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from) as u64);
+                }
+                return 0;
+            }
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some((now, written, plain)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, plain);
                 self.refresh_check(from, to);
+                if let Some((asking, own)) = crate::watch::standing() {
+                    let mut settled = self.settled.lock().unwrap_or_else(|e| e.into_inner());
+                    *settled = (asking, own, from, to);
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2418,7 +2474,7 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        self.copy(from, to, false);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
@@ -2484,12 +2540,43 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], plain: bool) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
         let last = (to - 1) / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        // Every page of the buffer has been copied once: the pages that
+        // could want copying are the ones `written` names, and the walk over
+        // the range's pages (9.9 GB of them a frame) is not needed.
+        if self.zeros.load(Ordering::Relaxed) == 0 {
+            for &(page, write) in written {
+                if page < from / PAGE || page > last {
+                    continue;
+                }
+                let at = &mut copied[page - base];
+                if write > *at {
+                    // A page only partly in the range stays stale for the
+                    // rest.
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        // The page is copied as of `write`, not this
+                        // asking: our own writes into title memory carry a
+                        // number past it (`crate::watch::wrote`), and a page
+                        // marked with this asking would be copied again at
+                        // every refresh.
+                        *at = now.max(write);
+                    }
+                    run.get_or_insert(page);
+                } else if let Some(first) = run.take() {
+                    bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to), plain);
+                }
+            }
+            if let Some(first) = run {
+                bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to), plain);
+            }
+            return bytes;
+        }
+        let mut writes = written.iter().peekable();
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -2502,29 +2589,45 @@ impl Shadow {
             if *at == 0 || write > *at {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
+                    if *at == 0 {
+                        self.zeros.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    *at = now.max(write);
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to), plain);
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to), plain);
         }
         bytes
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
-    fn copy(&self, from: usize, to: usize) -> usize {
+    fn copy(&self, from: usize, to: usize, plain: bool) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if plain && direct_copies() {
+            // SAFETY: write-watched memory is one committed reservation, so
+            // no page of the source can be gone (`crate::watch::writes`).
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            unsafe { std::ptr::copy(from as *const u8, at, to - from) };
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::DirectCopies, 1);
+                add(C::DirectUs, started.elapsed().as_micros() as u64);
+            }
+        } else {
+            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
@@ -2674,7 +2777,7 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n, self.watched.load(Ordering::Relaxed) == 1);
                 written = n;
             }
         } else {
@@ -2749,7 +2852,7 @@ impl Shadow {
             return 0;
         }
         crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n, self.watched.load(Ordering::Relaxed) == 1);
         n
     }
 }

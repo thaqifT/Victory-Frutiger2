@@ -221,9 +221,12 @@ const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
 /// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
+/// Series X on a 1080p set lists a 1080p mode), else the host's primary
+/// display as Windows has it now.
+///
+/// It was 3840x2160 by default, and the title rendered for it: internal
+/// targets at 2560x1440 on a 1920x1080 screen, two and a quarter times the
+/// pixels for no more picture (run `load`, 2026-11-25).
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -231,13 +234,52 @@ fn display_size() -> (u32, u32) {
             let (w, h) = v.trim().split_once(['x', 'X'])?;
             Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
         });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
+        let (size, from) = match asked {
+            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => {
+                ((w, h), "VICTORY_DISPLAY_MODE")
+            }
+            _ => match host_display() {
+                Some(size) => (size, "the host's primary display"),
+                None => ((1920, 1080), "the fallback: no display mode from Windows"),
+            },
         };
-        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
+        tracing::info!(
+            width = size.0,
+            height = size.1,
+            from,
+            "display mode reported to the title"
+        );
         size
     })
+}
+
+/// The primary display's current mode in pixels, as the display driver
+/// has it: `EnumDisplaySettingsW` reports the real mode whatever the
+/// process's DPI awareness, where `GetSystemMetrics` reports the desktop
+/// the process was told about.
+#[cfg(windows)]
+fn host_display() -> Option<(u32, u32)> {
+    use windows::Win32::Graphics::Gdi::{
+        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
+    };
+    // SAFETY: a zeroed DEVMODEW with its size set, as the call requires;
+    // it writes only into it.
+    let mut mode = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    // SAFETY: a valid out pointer of the size named above; the device name
+    // null asks for the display the desktop is on.
+    let ok = unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut mode) };
+    if !ok.as_bool() || mode.dmPelsWidth == 0 || mode.dmPelsHeight == 0 {
+        return None;
+    }
+    Some((mode.dmPelsWidth, mode.dmPelsHeight))
+}
+
+#[cfg(not(windows))]
+fn host_display() -> Option<(u32, u32)> {
+    None
 }
 
 /// The console's mode list: one 4K mode at 60 Hz (the title looks

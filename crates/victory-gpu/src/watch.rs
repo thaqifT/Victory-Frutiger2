@@ -57,6 +57,22 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     kept: false,
 });
 
+/// The submission's one asking stands ([`ask_once`]): its number while it
+/// does, 0 while none does.
+static STANDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How many times we have written title memory ourselves while a standing
+/// asking was in place ([`wrote`]): a refresh that saw one count has nothing
+/// to copy until it is higher.
+static OWN_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The asking that stands for this submission and how many of our own writes
+/// it has seen ([`standing`]'s pair): a copy refreshed under the same pair
+/// over a range that covers another's has nothing new to copy there.
+pub(crate) fn standing() -> Option<(u64, u64)> {
+    let asking = STANDING.load(std::sync::atomic::Ordering::Relaxed);
+    (asking != 0).then(|| (asking, OWN_WRITES.load(std::sync::atomic::Ordering::Relaxed)))
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -64,6 +80,52 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
+
+/// Whether the kernel write-watches the page at `page` (asked without
+/// resetting what it holds).
+fn watched(page: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let mut found = [0usize; 1];
+    let mut count = 1usize;
+    let mut granularity = 0u32;
+    // SAFETY: the answer buffer holds one entry.
+    unsafe {
+        GetWriteWatch(
+            0,
+            (page * PAGE) as *const _,
+            PAGE,
+            found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        ) == 0
+    }
+}
+
+/// How far [`ask_split`] halves a range the kernel refuses, and the least it
+/// asks about.
+const SPLIT_DEPTH: u32 = 14;
+const SPLIT_MIN: usize = 32;
+
+/// Asks about `[first, last)`; if the kernel refuses it, by halves: a buffer
+/// with one page that is not committed anywhere in it fails whole (run `why`:
+/// 1,444 of 1,675 askings refused, and every refresh of those ranges then
+/// asked live). The first page is probed first: memory that is not
+/// write-watched at all is left alone rather than halved down to nothing.
+fn ask_split(j: &mut Journal, first: usize, last: usize, depth: u32) {
+    if last <= first {
+        return;
+    }
+    if ask_kernel(j, first, last) {
+        j.ahead.push((first, last));
+        return;
+    }
+    if depth == 0 || last - first <= SPLIT_MIN || !watched(first) {
+        return;
+    }
+    let mid = first + (last - first) / 2;
+    ask_split(j, first, mid, depth - 1);
+    ask_split(j, mid, last, depth - 1);
+}
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
@@ -191,11 +253,15 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            ask_split(j, first, last, SPLIT_DEPTH);
         }
     }
     j.kept = !j.ahead.is_empty();
+    if j.kept {
+        // The asking stands for this submission ([`standing`]).
+        STANDING.store(j.ahead_asked, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -205,6 +271,7 @@ pub(crate) fn ask_once_end() {
     if j.kept {
         j.kept = false;
         j.ahead.clear();
+        STANDING.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -221,6 +288,9 @@ pub(crate) fn wrote(at: usize, len: usize) {
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
     }
+    // A refresh that has seen the count before this one has nothing new to
+    // copy ([`standing`]).
+    OWN_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -228,6 +298,9 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// write-watched does. A piece alone is left to [`writes`].
 fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     if pieces.len() < 2 {
+        if let Some(&(first, last)) = pieces.first() {
+            ask_split(j, first, last, SPLIT_DEPTH);
+        }
         return;
     }
     let first = pieces[0].0;
@@ -264,12 +337,15 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         )
     } != 0;
     if failed {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::AskFails, 1);
         return false;
     }
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
+        add(C::WatchesAhead, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
@@ -298,9 +374,12 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
-/// kernel just reported. `None` if the memory is not write-watched (nor,
-/// with `guarded`, view memory, which is then guarded).
-pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+/// kernel just reported. The third value says the memory is write-watched
+/// (one committed reservation, so no page of it can be gone: a copy of it
+/// may read it with a plain `memcpy`), and not view memory guarded by hand.
+/// `None` if the memory is not write-watched (nor, with `guarded`, view
+/// memory, which is then guarded).
+pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>, bool)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -308,12 +387,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::JournalHits, 1);
         return Some((
             j.ahead_asked,
             j.written
                 .range(first..last)
                 .map(|(&p, &w)| (p, w))
                 .collect(),
+            true,
         ));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -332,6 +414,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
+    // The kernel answers only for memory that is committed and one
+    // reservation; what it refuses is guarded instead, and is not that.
+    let mut plain = !failed;
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -342,6 +427,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         let written = guard(first * PAGE, last * PAGE);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        plain = false;
         written?
     } else {
         Vec::new()
@@ -350,6 +436,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
+        add(C::WatchesLive, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
@@ -365,6 +452,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .range(first..last)
             .map(|(&p, &w)| (p, w))
             .collect(),
+        plain,
     ))
 }
 
@@ -733,21 +821,22 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
+        let (_, before, plain) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
+        assert!(plain, "write-watched memory is one committed reservation");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
-        let (now, after) = writes(start, end, false).expect("watched");
+        let (now, after, _) = writes(start, end, false).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
-        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
+        let (later, again, _) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
-        let mut plain = vec![0u8; PAGE];
+        let mut block = vec![0u8; PAGE];
         assert!(
             writes(
-                plain.as_mut_ptr() as usize,
-                plain.as_ptr() as usize + PAGE,
+                block.as_mut_ptr() as usize,
+                block.as_ptr() as usize + PAGE,
                 true
             )
             .is_none()

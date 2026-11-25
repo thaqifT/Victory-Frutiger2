@@ -5414,11 +5414,10 @@ impl HostList {
                         batch.title_written();
                     }
                     work();
-                    // It wrote title memory, where is not known here: the
-                    // submission's one asking ends, later refreshes ask anew.
-                    if matches!(step, Step::Run(_)) {
-                        crate::watch::ask_once_end();
-                    }
+                    // A `Step::Run` is a copy in title memory that tells the
+                    // journal where it wrote (`crate::watch::wrote`, in
+                    // `list::copy_memory`): the submission's one asking
+                    // stands across it.
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -5825,9 +5824,21 @@ fn direct_writes() -> bool {
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+///
+/// `plain` says the destination lies in a write-watched buffer (one
+/// committed reservation, `crate::watch::writes`' third value): every page of
+/// it is there and writable, so the copy is a `memcpy`. The kernel's write
+/// costs 1-2 ms a call whatever the bytes; run `stand` put 34 MB back in 33 ms
+/// that way.
+pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize, plain: bool) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if plain && len != 0 {
+        // SAFETY: write-watched memory is one committed reservation of
+        // writable pages; the source is our mapped host copy.
+        unsafe { std::ptr::copy(src, dst, len) };
+        return;
+    }
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);

@@ -127,8 +127,27 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Copies read with a plain `memcpy` (write-watched memory, which is one
+    /// committed reservation: no page can be gone) and their microseconds.
+    DirectCopies,
+    DirectUs,
+    /// Write-watch askings made ahead of a submission (`ask_kernel`) and
+    /// made live by a refresh the asking did not cover (`writes`), and the
+    /// refreshes answered from the journal without asking the kernel.
+    WatchesAhead,
+    WatchesLive,
+    JournalHits,
+    /// Refreshes left uncopied because the same range was refreshed under
+    /// the same standing asking already (`Shadow::update_free`), and their
+    /// bytes.
+    Settled,
+    SettledBytes,
+    /// Ranges `ask_once` asked about and the kernel refused (not
+    /// write-watched), and the asks the texture staging path made.
+    AskFails,
+    TexAsks,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 89;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1066,9 +1085,10 @@ pub(crate) fn log(frames: f64) {
     let ms = |v: f64| v / 1e3;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
-         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
-         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms \
+         ({:.0} of them plain memcpy, {:.2} ms), {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms \
+         ({:.0} ahead, {:.0} live, {:.0} journal), {:.1} MB checked, {:.1} MB \
+         unchanged; {:.0} settled {:.1} MB; {:.0} ask failures, {:.0} texture asks; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -1082,12 +1102,21 @@ pub(crate) fn log(frames: f64) {
         c[C::Queries as usize],
         ms(c[C::QueryUs as usize]),
         ms(c[C::MoveUs as usize]),
+        c[C::DirectCopies as usize],
+        ms(c[C::DirectUs as usize]),
         mb(c[C::Unmapped as usize]),
         faults as f64 / frames,
         c[C::Watches as usize],
         ms(c[C::WatchUs as usize]),
+        c[C::WatchesAhead as usize],
+        c[C::WatchesLive as usize],
+        c[C::JournalHits as usize],
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
+        c[C::Settled as usize],
+        mb(c[C::SettledBytes as usize]),
+        c[C::AskFails as usize],
+        c[C::TexAsks as usize],
         c[C::Fallbacks as usize],
         c[C::GuardFaults as usize],
         mb(c[C::TexWatched as usize]),

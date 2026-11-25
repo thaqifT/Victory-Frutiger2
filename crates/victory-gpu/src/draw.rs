@@ -1482,20 +1482,55 @@ impl State {
         // slots, 1.8 us each, almost all of them unchanged
         // (2026-11-25, run 13).
         let slow_at = (*passes as usize) % full as usize;
+        // Slots whose view is unchanged but whose memory has no host copy yet:
+        // retried on the slot's turn for the slow path, not every pass. Left
+        // out, 11,765 of 14,476 slots mirrored again every frame for a copy
+        // that was never there, 126 ms of a 185 ms pass (2026-11-26, run
+        // `split`). A copy that arrives is picked up within `full` passes, the
+        // same interval a released resource's stale view already waits.
+        static NOCOPY: std::sync::Mutex<
+            Option<std::collections::HashMap<usize, std::collections::HashMap<u32, u64>>>,
+        > = std::sync::Mutex::new(None);
+        let mut nocopy_kept = NOCOPY.lock().unwrap_or_else(|e| e.into_inner());
+        let nocopy = nocopy_kept
+            .get_or_insert_with(Default::default)
+            .entry(std::ptr::from_ref(host) as usize)
+            .or_default();
+        // Where the loop's time goes: slots left as they were (a key read and
+        // a map look), and slots that go on to be mirrored.
+        let (mut fast_n, mut slow_n, mut mirror_n, mut nocopy_n) = (0u64, 0u64, 0u64, 0u64);
+        let mut mirror_us = 0u64;
         for (n, &index) in slots.iter().enumerate() {
             let handle = heap.handle(index);
+            let key = handle.and_then(crate::descriptor::slot_key);
             if n % full as usize != slow_at
-                && let Some(handle) = handle
-                && let Some(key) = crate::descriptor::slot_key(handle)
-                && ranges.get(&index).is_some_and(|r| r.3 == key)
+                && let Some(key) = key
             {
-                continue;
+                if ranges.get(&index).is_some_and(|r| r.3 == key) {
+                    fast_n += 1;
+                    continue;
+                }
+                if nocopy.get(&index) == Some(&key) {
+                    fast_n += 1;
+                    nocopy_n += 1;
+                    continue;
+                }
             }
+            slow_n += 1;
             ranges.remove(&index);
+            nocopy.remove(&index);
             let Some(handle) = handle else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            #[cfg(feature = "diagnostics")]
+            let mirror_at = std::time::Instant::now();
+            let view = host.mirror(index, handle, true);
+            mirror_n += 1;
+            #[cfg(feature = "diagnostics")]
+            {
+                mirror_us += mirror_at.elapsed().as_micros() as u64;
+            }
+            let Some(view) = view else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1516,13 +1551,18 @@ impl State {
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                // No host copy for what this view reads: noted so the slot is
+                // not mirrored again until its turn comes round.
+                if let Some(key) = key {
+                    nocopy.insert(index, key);
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len, crate::descriptor::slot_key(handle).unwrap_or(0)));
+            ranges.insert(index, (shadow, address, address + len, key.unwrap_or(0)));
         }
         let views = ranges.len() as u32;
         let slot_us = slots_phase.elapsed().as_micros() as u64;
@@ -1589,6 +1629,11 @@ impl State {
                     copies = spans.len(),
                     us = total_us,
                     slots_us = slot_us,
+                    fast = fast_n,
+                    slow = slow_n,
+                    mirrored = mirror_n,
+                    nocopy = nocopy_n,
+                    mirror_us,
                     refresh_us,
                     texture_us,
                     tex_remap_us = TEX_PHASE[0].load(Ordering::Relaxed),
