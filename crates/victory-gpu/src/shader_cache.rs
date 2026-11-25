@@ -19,17 +19,25 @@ use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
+static FOLDER: OnceLock<PathBuf> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
-    match Cache::open(dir) {
+    match Cache::open(dir.clone()) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
+            let _ = FOLDER.set(dir);
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
     }
+}
+
+/// The cache folder, for what goes beside it (the shaders that did not
+/// translate, kept for replaying offline).
+pub(crate) fn folder() -> Option<&'static PathBuf> {
+    FOLDER.get()
 }
 
 /// Shaders found in the cache and translated since the start.

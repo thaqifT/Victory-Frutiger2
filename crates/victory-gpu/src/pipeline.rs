@@ -151,6 +151,18 @@ impl Shader {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
+                // A shader the translator refused is kept beside the cache, so it can be
+                // replayed offline (`victory-shader --bin translate`) without the game.
+                if done.is_err()
+                    && let Some(dir) = crate::shader_cache::folder()
+                {
+                    let dir = dir.join("failed");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(
+                        dir.join(format!("{}.{}.cdxil", self.hash, self.stage)),
+                        &self.container,
+                    );
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,

@@ -2,8 +2,15 @@
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
 //! size. Only in builds with diagnostics.
+//!
+//! Two more switches, for watching a session rather than a frame:
+//! `VICTORY_CAPTURE_EVERY=<seconds>` saves a picture that often, numbered
+//! `shot-<k>.png` in the order taken (a timeline of what the title showed);
+//! `VICTORY_CAPTURE_OPS=<frames>` traces the draws of one frame in every
+//! that many, to their `frame-<n>-ops.txt`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -14,6 +21,51 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
     FOLDER
         .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
         .as_ref()
+}
+
+/// The frame a `VICTORY_CAPTURE_EVERY` picture was decided for, and how
+/// many have been taken.
+static TIMED: AtomicU64 = AtomicU64::new(u64::MAX);
+static SHOTS: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_CAPTURE_EVERY=<seconds>`: whether frame `n` is the one to save
+/// as a timeline picture (the first frame presented at least that long
+/// after the one before). Asked more than once for a frame: the answer is
+/// the same each time, and the clock moves once.
+pub(crate) fn every(n: u64) -> bool {
+    static GAP: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    static STATE: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
+    let Some(gap) = *GAP.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_EVERY")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|s| *s > 0.0)
+            .map(std::time::Duration::from_secs_f64)
+    }) else {
+        return false;
+    };
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    match *state {
+        // Asked again for a frame already decided: the same answer, no clock.
+        Some((frame, _)) if frame == n => return true,
+        Some((_, at)) if at.elapsed() < gap => return false,
+        _ => {}
+    }
+    *state = Some((n, std::time::Instant::now()));
+    TIMED.store(n, Ordering::Relaxed);
+    true
+}
+
+/// `VICTORY_CAPTURE_OPS=<frames>`: whether frame `n` has its draws traced.
+fn ops_every(n: u64) -> bool {
+    static K: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let k = *K.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_OPS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    });
+    k != 0 && n.is_multiple_of(k)
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
@@ -47,7 +99,9 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+        || ops_every(n)
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -152,12 +206,19 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || every(n))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    // A timeline picture is numbered in the order taken, so the files sort
+    // into the order the title showed them.
+    if TIMED.load(Ordering::Relaxed) == n {
+        let k = SHOTS.fetch_add(1, Ordering::Relaxed);
+        save_as(&format!("shot-{k:04}"), width, height, pitch, bgra, rows);
+    } else {
+        save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    }
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
@@ -339,22 +400,51 @@ pub(crate) fn save_read_back(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
-fn dump_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+/// `VICTORY_DUMP_TARGETS`: 0 off, 1 every target, 2 only the small ones (the
+/// 1x1 luminance and exposure targets, whose values the log then carries as
+/// numbers beside each timeline picture).
+fn dump_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if folder().is_none() {
+            return 0;
+        }
+        match std::env::var("VICTORY_DUMP_TARGETS") {
+            Ok(v) if v.trim().eq_ignore_ascii_case("small") => 2,
+            Ok(_) => 1,
+            Err(_) => 0,
+        }
+    })
+}
+
+/// Whether frame `n`'s targets are dumped: a listed frame, or the frame a
+/// timeline picture is taken of (`VICTORY_CAPTURE_EVERY`), so a blown-out
+/// picture arrives with the exposure values that made it.
+pub(crate) fn dumping(n: u64) -> bool {
+    dump_mode() != 0 && (listed(n) || TIMED.load(Ordering::Relaxed) == n)
 }
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    let mode = dump_mode();
+    if resource.is_null() || mode == 0 || !dumping(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|&(r, _)| r == resource as usize)
-        && let Some(copy) = crate::resource::host_copy(resource)
-    {
-        targets.push((resource as usize, copy));
+    if targets.iter().any(|&(r, _)| r == resource as usize) {
+        return;
     }
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    if mode == 2 {
+        // SAFETY: a live host texture.
+        let d = unsafe { copy.texture.GetDesc() };
+        if u64::from(d.Width) * u64::from(d.Height) > 64 {
+            return;
+        }
+    }
+    targets.push((resource as usize, copy));
 }
 
 /// At the present of frame `frame`: saves the noted targets.

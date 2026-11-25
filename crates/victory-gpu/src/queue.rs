@@ -810,7 +810,7 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
-        if crate::capture::listed(frame) {
+        if crate::capture::dumping(frame) {
             crate::capture::dump_targets(frame);
         }
     }

@@ -1207,6 +1207,16 @@ impl<'a> Lanes<'a> {
                         {
                             self.active.insert(k.0);
                         }
+                        if crate::emit::lower::tracing_masks() {
+                            eprintln!(
+                                "maskdef {:#x} {} lo={:?} hi={:?} active={}",
+                                inst.machine.offset,
+                                name,
+                                k.0,
+                                k.1,
+                                self.active.contains(&k.0)
+                            );
+                        }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
                         self.scc_lane.insert(scc, m);

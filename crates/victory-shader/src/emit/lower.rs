@@ -333,6 +333,13 @@ pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 
+/// `VICTORY_TRACE_MASKS`: prints where lane masks are made and why one is
+/// refused as data. For reading a refusal offline (`translate`).
+pub(crate) fn tracing_masks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_MASKS").is_some())
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
@@ -3109,6 +3116,38 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether every lane of the wave reaches block `b`: from the entry
+    /// block, every step is an unconditional jump or a branch the whole wave
+    /// takes together ([`Structured::wide`]). A ballot taken where such a
+    /// block ends sees every lane, so it gives the mask's bits exactly.
+    fn every_lane(&self, b: usize) -> bool {
+        let mut seen = vec![false; self.x.p.blocks.len()];
+        let mut pending = vec![0usize];
+        while let Some(x) = pending.pop() {
+            if std::mem::replace(&mut seen[x], true) {
+                continue;
+            }
+            // Lanes only leave a block at its branch, and only a branch the
+            // wave does not take together splits them.
+            let together = self.x.st.wide.contains(&x)
+                || matches!(self.x.st.exits[x], LaneExit::Jump(_) | LaneExit::End);
+            if !together {
+                continue;
+            }
+            match self.x.st.exits[x] {
+                LaneExit::Jump(t) => pending.push(t),
+                LaneExit::Branch {
+                    taken, not_taken, ..
+                } => {
+                    pending.push(taken);
+                    pending.push(not_taken);
+                }
+                LaneExit::End | LaneExit::Indirect => {}
+            }
+        }
+        seen.get(b).copied().unwrap_or(false)
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -3121,8 +3160,42 @@ impl<'a> Lower<'a> {
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
         let made = self.def_block.get(&lo).copied();
-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+        let whole = !self.local && made.is_none_or(|b| self.all_lanes(b) && self.every_lane(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            if tracing_masks() {
+                let insns = made.map(|b| {
+                    self.x.p.blocks[b]
+                        .insts
+                        .iter()
+                        .map(|i| format!("{:#x}:{}", i.machine.offset, i.name()))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
+                let preds = made.map(|b| {
+                    self.x.p.blocks[b]
+                        .preds
+                        .iter()
+                        .map(|&q| {
+                            format!(
+                                "{q}:wide={} exit={:?}",
+                                self.x.st.wide.contains(&q),
+                                self.x.st.exits[q]
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
+                eprintln!(
+                    "maskfail {lo:?} block={made:?} all_lanes={:?} every_lane={:?} exchange={} local={} reach_true={:?}\n  insns=[{}]\n  preds=[{}]",
+                    made.map(|b| self.all_lanes(b)),
+                    made.map(|b| self.every_lane(b)),
+                    self.exchange.is_some(),
+                    self.local,
+                    made.map(|b| self.x.st.reach[b] == Bool::TRUE),
+                    insns.unwrap_or_default(),
+                    preds.unwrap_or_default(),
+                );
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
