@@ -448,15 +448,20 @@ impl TextureQueue {
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
-    /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    /// the order to serve them, the two classes in turns:
+    /// - the ones looked at before (their memory was not mapped, or only
+    ///   part of it), newest write first: the look is a query, and memory
+    ///   that has arrived since is what the title streamed in last;
+    /// - the others, the newest write first and the oldest next, in turns:
+    ///   slot order served the low slots of a backlog of 25,000-40,000
+    ///   while the textures of the shot on screen waited (run 52: 98% of
+    ///   the drawn pixels had no colour texture in the first 3D frames).
+    ///
+    /// The turns are the point. A world half streamed in parks 14,000
+    /// slots in the first class, and it used to take the whole of `max`:
+    /// the second class was truncated away every frame, so a texture the
+    /// title had just asked for and never seen - the wall ahead, the face
+    /// on screen - was never uploaded at all, however long the run went.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
@@ -474,17 +479,38 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        // The oldest last, so that a scene's backlog loads from both ends.
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len());
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
         }
-        order.truncate(max);
+        // A look at memory that may have arrived since comes first, then the
+        // two classes in turns. The turns are the point: a world half
+        // streamed in parks 8,000 slots in the first class, and it used to
+        // take the whole of `max` - the second class was truncated away
+        // every frame, so a texture the title had just asked for and never
+        // seen, the wall ahead and the face on screen, was never uploaded at
+        // all, however long the run went (run 16: 18,219 slots due, 4,096
+        // served, the oldest written 3,268 frames before).
+        let most_again = max.div_ceil(2);
+        let mut order: Vec<(u32, u64)> = Vec::with_capacity(max.min(again.len() + fresh_order.len()));
+        let (mut a, mut f) = (0, 0);
+        while order.len() < max && (a < again.len() || f < fresh_order.len()) {
+            if a < again.len() && a < most_again {
+                order.push((again[a].1, again[a].2));
+                a += 1;
+            }
+            if order.len() < max && f < fresh_order.len() {
+                order.push((fresh_order[f].0, fresh_order[f].1));
+                f += 1;
+            }
+        }
         order
     }
 
@@ -2934,6 +2960,32 @@ mod tests {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [1]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// A backlog of retries does not take the whole of a pass: a texture
+    /// the title has asked for and never seen is served in the same pass.
+    #[test]
+    fn a_backlog_of_retries_does_not_starve_a_texture_never_seen() {
+        let Some(heap) = HostHeap::new(false, 64) else {
+            return; // no host GPU
+        };
+        let frame = 100;
+        // Six slots whose memory was not there: looked at again next frame.
+        for index in 0..6 {
+            heap.queue_texture(index, true, false, frame);
+        }
+        let again = heap.texture_slots_due(frame, 64).0;
+        assert_eq!(again.len(), 6);
+        for (index, write) in again {
+            heap.texture_slot_away(index, write, frame, 1);
+        }
+        // Two the title has just asked for.
+        heap.queue_texture(6, true, false, frame);
+        heap.queue_texture(7, true, false, frame);
+        // A pass of four slots, which the retries alone used to fill.
+        let order: Vec<u32> = heap.texture_slots_due(frame + 1, 4).0.into_iter().map(|d| d.0).collect();
+        assert_eq!(order.len(), 4);
+        assert!(order.iter().any(|&index| index >= 6), "{order:?}");
     }
 
     /// A slot a draw read through a table leaves the queue; the title's

@@ -1817,7 +1817,11 @@ impl State {
         host.texture_slots_remapped(frame);
         let remap_us = remap_phase.elapsed().as_micros() as u64;
         let queue_phase = std::time::Instant::now();
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        // Not 4,096: a world half streamed in has 18,000 slots due, and the
+        // pass breaks on its byte and time budget long before it has served
+        // a tenth of them. The cap only bounds the list it walks, and the
+        // walk stops at the budget, so a longer list costs only its pushes.
+        let (due, census) = host.texture_slots_due(frame, 16384);
         TEX_PHASE[1].store(queue_phase.elapsed().as_micros() as u64, Ordering::Relaxed);
         TEX_PHASE[0].store(remap_us, Ordering::Relaxed);
         TEX_PHASE[2].store(due.len() as u64, Ordering::Relaxed);

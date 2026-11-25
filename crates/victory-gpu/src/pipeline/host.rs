@@ -590,7 +590,23 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        state = %state,
+                        mesh_bytes = code(0).BytecodeLength,
+                        pixel_bytes = code(1).BytecodeLength,
+                        targets = g.targets.NumRenderTargets,
+                        formats = format_args!(
+                            "{:?}",
+                            &g.targets.RTFormats[..(g.targets.NumRenderTargets.min(8) as usize)]
+                        ),
+                        depth_format = g.depth_format.0,
+                        samples = format_args!("{}x{}", g.samples.Count, g.samples.Quality),
+                        sample_mask = g.sample_mask,
+                        depth_bounds,
+                        "host mesh pipeline refused"
+                    );
                     host.log_messages();
                     return None;
                 }

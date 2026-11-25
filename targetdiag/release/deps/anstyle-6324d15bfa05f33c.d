@@ -1,0 +1,12 @@
+E:\GTA6_Frutiger\victory\targetdiag\release\deps\anstyle-6324d15bfa05f33c.d: C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\lib.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\macros.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\color.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\effect.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\reset.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\style.rs
+
+E:\GTA6_Frutiger\victory\targetdiag\release\deps\libanstyle-6324d15bfa05f33c.rlib: C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\lib.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\macros.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\color.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\effect.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\reset.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\style.rs
+
+E:\GTA6_Frutiger\victory\targetdiag\release\deps\libanstyle-6324d15bfa05f33c.rmeta: C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\lib.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\macros.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\color.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\effect.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\reset.rs C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\style.rs
+
+C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\lib.rs:
+C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\macros.rs:
+C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\color.rs:
+C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\effect.rs:
+C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\reset.rs:
+C:\Users\thaqi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\style.rs:
