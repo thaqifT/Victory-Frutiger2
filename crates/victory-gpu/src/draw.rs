@@ -1057,6 +1057,23 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEWS {
+                        // Ours: the title addresses of the heap's buffer
+                        // views, for a descriptor read as data.
+                        match self.heap_views(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads view addresses of a heap that is not set"),
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -1634,6 +1651,26 @@ impl State {
             }
         }
         crate::resource::card_accounting(room, due, never, gone);
+    }
+
+    /// [`State::heap_buffers`] for a shader that reads a descriptor's
+    /// address as data: the GPU address of the host's table of the buffer
+    /// views' title addresses by heap slot. The pass that readies the
+    /// buffer views also fills the table.
+    fn heap_views(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.views_gpu()?;
+        self.heap_buffers(list)?;
+        if let Some(buffer) = host.views_buffer() {
+            list.keep(buffer);
+        }
+        Some(gpu)
     }
 
     /// The texture side of [`State::heap_buffers`]: textures the title fills
