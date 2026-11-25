@@ -475,6 +475,16 @@ fn dump_one(
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
+    // Which target the values below belong to: the texel and range lines
+    // name only the format, and several targets share one.
+    tracing::info!(
+        ?resource,
+        index = i,
+        width = d.Width,
+        height = d.Height,
+        format = d.Format.0,
+        "dumping a target"
+    );
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: an open list of ours and a live texture.

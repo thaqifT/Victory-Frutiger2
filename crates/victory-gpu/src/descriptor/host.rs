@@ -1743,6 +1743,23 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 /// A buffer view of title memory at `address` on its host copy: the first
 /// element moves by the copy's offset.
 /// Bytes per element of a buffer view.
+/// The raw view of `bytes` bytes of a `width`-byte buffer starting at host
+/// byte `offset`: the first dword and how many of them, cut to the buffer.
+/// Only exact for a `offset` on a dword -- a raw view cannot name a byte --
+/// so a view that starts mid-dword has no exact host shape and is left to the
+/// caller to refuse.
+fn raw_at(offset: u64, bytes: u64, width: u64) -> Option<(u64, u32)> {
+    if !offset.is_multiple_of(4) {
+        return None;
+    }
+    let dwords = (width / 4).max(1);
+    let at = (offset / 4).min(dwords - 1);
+    let start = at * 4;
+    let end = start.saturating_add(bytes.max(4)).min(width);
+    let n = end.saturating_sub(start).div_ceil(4).max(1).min(dwords - at);
+    u32::try_from(n).ok().map(|n| (at, n))
+}
+
 fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
@@ -1998,10 +2015,12 @@ fn buffer_srv(
         };
     }
     let element = element_size(&desc);
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
-        if element == 0 || offset % element != 0 {
+        if element == 0 {
             once!(
                 offset,
                 element,
@@ -2009,12 +2028,35 @@ fn buffer_srv(
             );
             return None;
         }
-        buffer.FirstElement += offset / element;
+        if offset % element != 0 {
+            // The copy's offset does not land on an element of the view's
+            // format (the console's heap holds such views; the offset is the
+            // host copy's, so any address the title names can land inside an
+            // element). Left null the shader read nothing from the slot and
+            // drew a black wedge across the frame, so the same bytes are
+            // named as a raw view, which the shader's own type reads -- as
+            // `fit_buffer_view` does for a shape the host refuses.
+            let bytes = u64::from(buffer.NumElements) * element;
+            let Some((at, n)) = raw_at(offset, bytes, width) else {
+                once!(
+                    offset,
+                    element,
+                    "buffer view not on an element of its host copy"
+                );
+                return None;
+            };
+            once!(offset, element, "buffer view off an element boundary, made raw");
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+            buffer.FirstElement = at;
+            buffer.NumElements = n;
+            buffer.StructureByteStride = 0;
+            buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        } else {
+            buffer.FirstElement += offset / element;
+        }
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-    // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         // Left null before: the draw read nothing from the slot and drew
         // garbage (black wedges). Make it in the shape the host takes.
@@ -2098,16 +2140,33 @@ fn buffer_uav(
         buffer.StructureByteStride = 0;
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     } else {
-        if element == 0 || offset % element != 0 {
+        if element == 0 {
             once!(offset, element, "unordered buffer view not on an element of its host copy");
             return None;
         }
-        buffer.FirstElement += offset / element;
+        if offset % element != 0 {
+            // As in `buffer_srv`: the same bytes as a raw view, since the
+            // copy's offset need not land on an element of the format.
+            // SAFETY: a live buffer.
+            let width = unsafe { shadow.buffer.GetDesc() }.Width;
+            let bytes = u64::from(buffer.NumElements) * element;
+            let Some((at, n)) = raw_at(offset, bytes, width) else {
+                once!(offset, element, "unordered buffer view not on an element of its host copy");
+                return None;
+            };
+            once!(offset, element, "unordered buffer view off an element boundary, made raw");
+            buffer.FirstElement = at;
+            buffer.NumElements = n;
+            buffer.StructureByteStride = 0;
+            buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        } else {
+            buffer.FirstElement += offset / element;
+        }
     }
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-    if window.is_some() {
+    if window.is_some() || raw {
         // (Left out at first: every structured unordered access view was then
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
