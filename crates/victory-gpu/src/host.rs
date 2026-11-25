@@ -348,6 +348,12 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Where a submission's copying back goes, in microseconds since the last
+/// frame-rate line: fetching what shaders wrote to the card's memory, walking
+/// the declared writes and merging them into title memory, and finishing the
+/// plan.
+static COPY_BACK_SPLIT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// The last value the render queue was told to signal on the host's fence.
 /// The copy queue that fetches what shaders wrote waits for it before it
 /// reads: memory the title's shaders are writing may not be read while
@@ -1600,6 +1606,11 @@ fn rehash_runs() -> bool {
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Where a fetch of what shaders wrote to the card's memory goes, per frame:
+/// microseconds building the piece list, microseconds waiting for the fetch
+/// to land, ranges seen, ranges the card did not compare (every piece of one
+/// is fetched), pieces fetched, bytes fetched.
+static CARD_BACK: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
@@ -2831,18 +2842,28 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
+    // A submission declares the same big ranges dozens of times over: the
+    // walk is a map each way, not a search of what is already there (it was
+    // quadratic in the declared ranges, in the copying back of every frame).
+    let mut at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashMap<usize, std::collections::HashSet<(usize, usize)>> =
+        std::collections::HashMap::new();
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let i = match at.get(&key) {
+                    Some(&i) => i,
+                    None => {
+                        back.push((shadow.clone(), Vec::new()));
+                        at.insert(key, back.len() - 1);
+                        back.len() - 1
                     }
-                    None => back.push((shadow.clone(), vec![range])),
+                };
+                if seen.entry(key).or_default().insert(range) {
+                    back[i].1.push(range);
                 }
             }
         }
@@ -3790,6 +3811,9 @@ impl Host {
         // where the bytes come down.
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
+        let building = std::time::Instant::now();
+        CARD_BACK[2].fetch_add(plan.ranges.len() as u64, Ordering::Relaxed);
+        CARD_BACK[3].fetch_add(plan.ranges.iter().filter(|r| !r.compared).count() as u64, Ordering::Relaxed);
         for (i, r) in plan.ranges.iter().enumerate() {
             for p in 0..r.span.pieces {
                 if r.compared && differs[(r.at + p) as usize] == 0 {
@@ -3803,6 +3827,9 @@ impl Host {
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
+        CARD_BACK[0].fetch_add(building.elapsed().as_micros() as u64, Ordering::Relaxed);
+        CARD_BACK[4].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+        CARD_BACK[5].fetch_add(total, Ordering::Relaxed);
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
@@ -3833,6 +3860,7 @@ impl Host {
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
                     stood(waiting);
+                    CARD_BACK[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
                     working(was_working);
                     Ok(())
                 })()
@@ -4086,6 +4114,9 @@ impl Host {
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
+                let mut at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+                let mut taken: std::collections::HashMap<usize, std::collections::HashSet<(usize, usize)>> =
+                    std::collections::HashMap::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
@@ -4094,15 +4125,19 @@ impl Host {
                         self.card_back(card, submitted, &mut seen);
                     }
                     for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
+                        let key = std::sync::Arc::as_ptr(shadow) as usize;
+                        let i = match at.get(&key) {
+                            Some(&i) => i,
+                            None => {
+                                back.push((shadow.clone(), Vec::new()));
+                                at.insert(key, back.len() - 1);
+                                back.len() - 1
                             }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                        };
+                        for range in ranges {
+                            if taken.entry(key).or_default().insert(*range) {
+                                back[i].1.push(*range);
+                            }
                         }
                     }
                 }
@@ -4219,6 +4254,7 @@ impl Host {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
+                        && !shadow.guarded()
                     {
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
@@ -4410,11 +4446,14 @@ impl Host {
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
+        COPY_BACK_SPLIT[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         let back = declared_writes(runs);
         hand_back(&back);
+        COPY_BACK_SPLIT[1].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         if let Some(card) = card {
             self.card_done(card);
         }
+        COPY_BACK_SPLIT[2].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if !back.is_empty() {
             crate::copystat::add(crate::copystat::C::BackSubmissions, 1);
@@ -5556,7 +5595,7 @@ impl Batch {
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
-                .filter(|r| !r.0.unwatched())
+                .filter(|r| !r.0.unwatched() && !r.0.guarded())
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
@@ -6066,6 +6105,15 @@ impl Meter {
         );
         late_line(frames);
         card_clock_line(frames, ms);
+        {
+            let [card, merge, done] = [0, 1, 2].map(|i| COPY_BACK_SPLIT[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            if card + merge + done >= 0.5 {
+                tracing::info!(
+                    "copying back per frame: {card:.1} ms fetching what shaders wrote to the card's memory, {merge:.1} ms \
+                     walking the declared writes and merging them into title memory, {done:.1} ms finishing the plans"
+                );
+            }
+        }
         crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -6074,6 +6122,18 @@ impl Meter {
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
                      ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
                     if rehash_runs() { "on" } else { "off" }
+                );
+            }
+            let [build, wait, ranges, uncompared, fetched, bytes] =
+                [0, 1, 2, 3, 4, 5].map(|i| CARD_BACK[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if ranges > 0.0 {
+                tracing::info!(
+                    "fetching what shaders wrote to the card's memory per frame: {ranges:.0} ranges ({uncompared:.0} of them not \
+                     compared on the card, every piece of one fetched), {:.1} ms building the piece list, {fetched:.0} pieces \
+                     {:.2} MB fetched, {:.1} ms waiting for the fetch to land",
+                    build / 1000.0,
+                    bytes / 1e6,
+                    wait / 1000.0
                 );
             }
         }

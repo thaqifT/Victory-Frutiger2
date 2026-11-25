@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -37,6 +37,11 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// Whether the memory is view memory the guards hold instead: the kernel
+    /// refuses every asking about it, so a submission does not ask about a
+    /// range of one at all. It was asked about every frame, halving on every
+    /// refusal (2,708 refusals a frame, run `backsplit`).
+    guarded: AtomicBool,
     /// How many pages of `copied` are still 0 (never copied). While none is,
     /// a refresh need look only at the pages the journal names: walking
     /// every page of every range instead was 2.4 million page looks a frame
@@ -1702,6 +1707,12 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether the copy is view memory the guards hold: the kernel refuses
+    /// every asking about it, so no submission asks about a range of one.
+    pub(crate) fn guarded(&self) -> bool {
+        self.guarded.load(Ordering::Relaxed)
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -1748,6 +1759,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
+            guarded: AtomicBool::new(false),
             zeros: AtomicUsize::new(pages as usize),
             settled: Mutex::new((0, 0, 0, 0)),
             pending: Mutex::default(),
@@ -2454,6 +2466,11 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written, plain)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
+                // The kernel refused this memory and the guards answered: it
+                // is a view, and no submission asks the kernel about it again.
+                if !plain {
+                    self.guarded.store(true, Ordering::Relaxed);
+                }
                 let copied = self.copy_stale(from, to, now, &written, plain);
                 self.refresh_check(from, to);
                 if let Some((asking, own)) = crate::watch::standing() {
