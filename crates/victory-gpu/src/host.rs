@@ -6106,6 +6106,16 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         {
+            let [calls, blocks, protects, covered] =
+                [0, 1, 2, 3].map(|i| crate::watch::GUARD_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if calls > 0.0 {
+                tracing::info!(
+                    "guarding per frame: {calls:.0} guard calls standing on {blocks:.0} blocks, {protects:.0} protect calls \
+                     covering {covered:.0} blocks"
+                );
+            }
+        }
+        {
             let [card, merge, done] = [0, 1, 2].map(|i| COPY_BACK_SPLIT[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
             if card + merge + done >= 0.5 {
                 tracing::info!(

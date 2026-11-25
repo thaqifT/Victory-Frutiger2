@@ -459,11 +459,22 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+/// Where a frame's guarding goes: calls to [`guard`], blocks it stood on
+/// (not skipped as a clean run), calls to [`protect`], and blocks those
+/// covered. Since the last frame-rate line.
+pub(crate) static GUARD_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
+    /// The same blocks as `clean`, as runs: first block → one past the last.
+    /// A range inside one run is answered by a lookup, not by collecting
+    /// every clean block of it: the title's 174 MB heap is 44,544 blocks,
+    /// and a frame asks about some 10 GB of view memory in 1,423 pieces
+    /// (run `guarded`: 17.6 ms of a 36.6 ms copies phase).
+    runs: BTreeMap<usize, usize>,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
@@ -472,11 +483,61 @@ struct Guards {
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
+    runs: BTreeMap::new(),
     absent: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Notes blocks `[from, to)` clean in `runs`, joining the runs they touch.
+fn mark_clean(g: &mut Guards, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let mut start = from;
+    let mut end = to;
+    if let Some((&s, &e)) = g.runs.range(..=from).next_back()
+        && e >= from
+    {
+        start = s;
+        end = end.max(e);
+        g.runs.remove(&s);
+    }
+    while let Some((&s, &e)) = g.runs.range(start..=end).next() {
+        end = end.max(e);
+        g.runs.remove(&s);
+    }
+    g.runs.insert(start, end);
+}
+
+/// Drops `block` from the clean runs, splitting the run it lies in.
+fn unmark_clean(g: &mut Guards, block: usize) {
+    let Some((&s, &e)) = g.runs.range(..=block).next_back() else {
+        return;
+    };
+    if block >= e {
+        return;
+    }
+    g.runs.remove(&s);
+    if s < block {
+        g.runs.insert(s, block);
+    }
+    if block + 1 < e {
+        g.runs.insert(block + 1, e);
+    }
+}
+
+/// Whether every block of `[first, last)` is clean: one lookup, if the run
+/// they lie in says so.
+fn all_clean(g: &Guards, first: usize, last: usize) -> bool {
+    clean_run_end(g, first).is_some_and(|end| end >= last)
+}
+
+/// One past the last clean block of the run `block` lies in, if it does.
+fn clean_run_end(g: &Guards, block: usize) -> Option<usize> {
+    g.runs.range(..=block).next_back().and_then(|(&_, &e)| (block < e).then_some(e))
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -504,25 +565,30 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // The range's clean blocks, in order: read off the set in one pass,
-    // not looked up one block at a time. A frame asks about some 10 GB of
-    // view memory, 150,000 blocks, nearly all clean: the lookups were most
-    // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
-    // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
-        // Nothing written, mapped or new since the range was last taken.
+    GUARD_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The range lies inside one clean run: nothing written, mapped or new
+    // since it was last taken.
+    if all_clean(&g, first, last) {
         return Some(written);
     }
-    let mut next_clean = 0;
+    // Blocks of a clean run are skipped whole, by one lookup, not one at a
+    // time: the frame checks some 7 GB of view memory, 1.7 million blocks,
+    // and 99% of them are clean (run `guarded`: 17-20 ms of the copies
+    // phase, which is the walk itself). Only the blocks that are not clean
+    // are stood on, and those are the ones a copy has to take.
+    let mut block = first;
     let mut uncommitted_until = first;
-    for block in first..=last {
-        while next_clean < clean.len() && clean[next_clean] < block {
-            next_clean += 1;
+    while block < last {
+        if let Some(end) = clean_run_end(&g, block) {
+            if let Some(from) = run.take() {
+                protect(&mut g, from, block);
+            }
+            block = end.min(last);
+            continue;
         }
-        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
+        let mut open = true;
+        GUARD_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if g.absent.contains(&block) {
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
             if block >= uncommitted_until {
@@ -538,14 +604,20 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+                mark_clean(&mut g, block, block + 1);
             } else {
                 run.get_or_insert(block);
+                block += 1;
                 continue;
             }
         }
         if let Some(from) = run.take() {
             protect(&mut g, from, block);
         }
+        block += 1;
+    }
+    if let Some(from) = run.take() {
+        protect(&mut g, from, last);
     }
     Some(written)
 }
@@ -599,6 +671,7 @@ fn is_view(start: usize, end: usize) -> bool {
 /// noting those not committed (unmapped) absent.
 fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    GUARD_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
@@ -612,8 +685,10 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         }
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
+        GUARD_STATS[3].fetch_add((to - from) as u64, std::sync::atomic::Ordering::Relaxed);
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        mark_clean(g, from, to);
     };
     if set(from, to) {
         note(g, from, to);
@@ -656,6 +731,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        unmark_clean(g, block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -744,6 +820,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        unmark_clean(&mut g, block);
     }
 }
 
