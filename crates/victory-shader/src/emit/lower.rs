@@ -281,10 +281,6 @@ struct Lower<'a> {
     balloting: HashSet<Value>,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
-    /// Per IR block whether every lane runs it, where a mask's value can be
-    /// read as data from a ballot taken in the block that wrote it: a lane
-    /// that never reaches that block sets no bit there.
-    all_blocks: Option<Vec<bool>>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -1549,10 +1545,6 @@ impl<'a> Lower<'a> {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
                 _ => MaskData::None,
-            },
-            all_blocks: match x.native.stage {
-                HwStage::Cs => all_lane_blocks(x.st),
-                _ => None,
             },
             mask_ok: false,
             ballots: HashMap::new(),
@@ -3129,19 +3121,7 @@ impl<'a> Lower<'a> {
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
         let made = self.def_block.get(&lo).copied();
-        // A compute program runs host lane n as console lane n (`MaskData::Console`), so a
-        // ballot taken in the block that wrote the mask is that mask bit for bit - as long as
-        // every lane runs that block. A lane that never reaches it sets no bit there on either
-        // machine, and the console's own mask keeps whatever it held before, so a mask written
-        // where lanes part is still refused.
-        let exact = self.mask_data == MaskData::Console
-            && made.is_none_or(|b| {
-                self.all_blocks
-                    .as_ref()
-                    .is_some_and(|all| all.get(b).copied().unwrap_or(false))
-            });
-        let whole = exact
-            || (self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b)));
+        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
