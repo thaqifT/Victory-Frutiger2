@@ -675,7 +675,7 @@ pub(crate) extern "system" fn create_stream(
         at += size;
     }
     #[cfg(windows)]
-    graphics.apply_integer_blend_bypass();
+    graphics.apply_blend_bypass();
     hand_out(
         shaders,
         #[cfg(windows)]

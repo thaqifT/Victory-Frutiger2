@@ -92,19 +92,30 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
-    /// The console's colour buffer bypasses its blender for integer
-    /// surfaces, even when the draw asks for blending. D3D12 checks blend
-    /// enable against every active target format when the pipeline is
-    /// created, and refuses the whole pipeline for one integer target
+    /// The console's colour buffer bypasses its blender on surfaces that
+    /// have no blender, even when the draw asks for blending: integer
+    /// targets, and the packed HDR and single-channel ones. D3D12 checks
+    /// blend enable against every active target format when the pipeline
+    /// is created and refuses the whole pipeline for one such target
     /// (`E_INVALIDARG`), so the state is corrected before it is made.
+    ///
+    /// One mesh pipeline is lost to this today: targets `R32_FLOAT`,
+    /// `B4G4R4A4_UNORM`, `R9G9B9E5_SHAREDEXP`, blend asked for — and the
+    /// shared-exponent HDR target has no blend stage at all, which took
+    /// the pipeline down with it (`host mesh pipeline refused … 0x80070057`)
+    /// and every draw that used it (`a draw with no host pipeline`).
     ///
     /// With shared blending D3D12 reads slot zero for every target: the
     /// shared description is expanded into all of them first, so that
     /// clearing one target's blend leaves the others' write masks alone.
-    pub(crate) fn apply_integer_blend_bypass(&mut self) {
-        let integer = |f: &DXGI_FORMAT| {
+    pub(crate) fn apply_blend_bypass(&mut self) {
+        /// A target format with no blend stage. Blending into one is
+        /// refused at pipeline creation, so a draw that asks for it is
+        /// given the bypass the console's own blender would have taken.
+        fn blendless(f: &DXGI_FORMAT) -> bool {
             matches!(
                 *f,
+                // Integer: the console's blender is a no-op on them.
                 DXGI_FORMAT_R32G32B32A32_UINT
                     | DXGI_FORMAT_R32G32B32A32_SINT
                     | DXGI_FORMAT_R32G32B32_UINT
@@ -126,19 +137,26 @@ impl GraphicsState {
                     | DXGI_FORMAT_R16_SINT
                     | DXGI_FORMAT_R8_UINT
                     | DXGI_FORMAT_R8_SINT
+                    // Renderable, but with no blend stage in the hardware.
+                    | DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+                    | DXGI_FORMAT_A8_UNORM
+                    | DXGI_FORMAT_R1_UNORM
+                    | DXGI_FORMAT_R8G8_B8G8_UNORM
+                    | DXGI_FORMAT_G8R8_G8B8_UNORM
+                    | DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM
             )
-        };
+        }
         let formats = &self.targets.RTFormats[..(self.targets.NumRenderTargets as usize).min(8)];
         if !self.blend.IndependentBlendEnable.as_bool() {
             let shared = self.blend.RenderTarget[0];
-            if !shared.BlendEnable.as_bool() || !formats.iter().any(integer) {
+            if !shared.BlendEnable.as_bool() || !formats.iter().any(blendless) {
                 return;
             }
             self.blend.RenderTarget[..formats.len()].fill(shared);
             self.blend.IndependentBlendEnable = (formats.len() > 1).into();
         }
         for (format, target) in formats.iter().zip(&mut self.blend.RenderTarget) {
-            if integer(format) {
+            if blendless(format) {
                 target.BlendEnable = false.into();
             }
         }

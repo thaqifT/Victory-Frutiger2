@@ -1894,13 +1894,30 @@ impl State {
         let most_ms = *SPAN_MS.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
         });
-        let span = std::time::Duration::from_millis((took / 3).clamp(8, most_ms.max(8)));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget. Not the
         // time: a backlog is exactly when the frame cannot spare more of it.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
+        // And a backlog inside a *long* frame gets more still. The budget was
+        // flat 192 MB (576 with the backlog's three) whether the frame took
+        // 200 ms or two seconds, so the world's load drained at 280 MB a
+        // second while the frame it drained in stood at 2 s for other
+        // reasons: 21,111 slots waiting and 41,087 textures that never got a
+        // host copy at all in a run, which is the black surfaces. The
+        // budget now follows the frame: a frame three times the 200 ms the
+        // budget was sized for stages three times the bytes, up to six.
+        // Recording grows with the bytes, so this is not free - it is the
+        // 46% of a load frame that is not recording that pays for it.
+        // `VICTORY_TEXTURE_LOAD_SCALE=0` keeps the flat budget.
+        static LOAD_SCALE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let load_scale = *LOAD_SCALE.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LOAD_SCALE").is_none_or(|v| v != "0"));
+        let scale = if load_scale && took > 400 { (took / 200).clamp(1, 6) } else { 1 };
+        // The span grows with the bytes it is there to bound, or it would cut
+        // the extra bytes short at the flat 250 ms.
+        let span = std::time::Duration::from_millis((took / 3).clamp(8, most_ms.saturating_mul(scale).max(8)));
+        let per_frame = per_frame.saturating_mul(scale).min(4096 << 20);
         let per_frame = if catchup && due.len() >= 1024 { per_frame * 3 } else { per_frame };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
