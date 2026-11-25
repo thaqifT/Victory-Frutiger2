@@ -3121,7 +3121,12 @@ impl<'a> Lower<'a> {
         // host waves know every lane runs that block.
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
-        if !self.x.st.active.contains(&lo) && !whole {
+        // A compute program runs host lane n as console lane n (`MaskData::Console`), so a
+        // ballot at the block that writes the mask covers exactly the lanes the console's own
+        // ballot covered: a lane that never reaches that block sets no bit there on either
+        // machine. The refusal below is for pixel and vertex programs, whose ballot is over
+        // whichever wave the host happens to run.
+        if !self.x.st.active.contains(&lo) && !whole && self.mask_data != MaskData::Console {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }

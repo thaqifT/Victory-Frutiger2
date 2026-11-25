@@ -691,7 +691,7 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                crate::host::copy_mapped_filled(read.as_mut_ptr(), self.memory, size);
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
@@ -753,7 +753,7 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                crate::host::copy_mapped_filled(read.as_mut_ptr(), self.memory, size);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;

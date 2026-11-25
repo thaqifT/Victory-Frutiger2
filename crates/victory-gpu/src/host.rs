@@ -745,6 +745,35 @@ mod tests {
 
     use super::*;
 
+    /// A hole in a streamed texture is filled with the bytes on its edge,
+    /// not with zeros: a tiled texture with a zero hole is the block swarm.
+    #[test]
+    fn a_filled_copy_continues_the_bytes_before_a_hole() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        const N: usize = 4 * BLOCK;
+        // SAFETY: we reserve a private region and commit two of its blocks,
+        // and only touch them while they are writable.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            for (block, value) in [(0, 0x11), (2, 0x22)] {
+                let at = base.add(block * BLOCK);
+                assert_eq!(VirtualAlloc(at.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                at.write_bytes(value, BLOCK);
+            }
+            let mut out = vec![0xAAu8; N];
+            super::copy_mapped_filled(out.as_mut_ptr(), base, N);
+            // What read stays.
+            assert!(out[..BLOCK].iter().all(|&v| v == 0x11));
+            assert!(out[2 * BLOCK..3 * BLOCK].iter().all(|&v| v == 0x22));
+            // The hole after each takes the bytes before it, not zeros.
+            assert!(out[BLOCK..2 * BLOCK].iter().all(|&v| v == 0x11));
+            assert!(out[3 * BLOCK..].iter().all(|&v| v == 0x22));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -5656,6 +5685,80 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             read_pieces(at, to, n);
         }
         offset += n;
+    }
+}
+
+/// [`copy_mapped`] for a texture read from title memory into the host's
+/// staging: a hole is filled with the bytes just before it instead of zeros
+/// ([`fill_holes`]).
+///
+/// A streamed texture is read while only some of its pages are mapped, and
+/// its holes were zero-filled. The buffer is still *tiled*, so a 64 KiB hole
+/// does not reach the screen as one black rectangle: the tiling scatters it
+/// into a diagonal drift of blocks, which is exactly the block-swarm band
+/// over the cop car, the boat's inside and Lucia's back in the screenshots of
+/// 2026-11-25. Continuing the neighbouring bytes keeps the tile's own colours
+/// across the hole: a smeared edge instead of a swarm.
+pub(crate) fn copy_mapped_filled(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    match crate::copystat::mode() {
+        1 => {
+            // SAFETY: timing only: the caller vouches for the source.
+            unsafe { std::ptr::copy(src, dst, len) };
+            return;
+        }
+        2 => return,
+        _ => {}
+    }
+    fill_holes(dst, src, len);
+}
+
+/// Copies `len` bytes from `src` to `dst` a [`HOLE_BLOCK`] at a time, and
+/// writes into every block that does not read the bytes of the last block
+/// that did. Nothing in the destination is left zero unless none of the
+/// blocks before it read either.
+fn fill_holes(dst: *mut u8, src: *const u8, len: usize) {
+    const HOLE_BLOCK: usize = 64 << 10;
+    let mut offset = 0;
+    let mut good: Option<(usize, usize)> = None;
+    while offset < len {
+        let n = HOLE_BLOCK.min(len - offset);
+        let at = src.wrapping_add(offset);
+        let to = dst.wrapping_add(offset);
+        if read(at, to, n) {
+            good = Some((offset, n));
+        } else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            match good {
+                Some((from, from_len)) => {
+                    // SAFETY: `from` lies before `offset` in the caller's
+                    // own destination, which is mapped for `len` bytes.
+                    unsafe { fill_from(dst.add(from), from_len, to, n) };
+                }
+                // SAFETY: the destination is the caller's, mapped for `len`.
+                None => unsafe { to.write_bytes(0, n) },
+            }
+        }
+        offset += n;
+    }
+}
+
+/// Writes `to_len` bytes at `to` by repeating the end of the `from_len`
+/// bytes at `from`: the bytes on the edge of a hole continue into it.
+///
+/// # Safety
+///
+/// `from` and `to` name mapped memory of their lengths, both inside one
+/// allocation, and `from` is not after `to`.
+unsafe fn fill_from(from: *const u8, from_len: usize, to: *mut u8, to_len: usize) {
+    let mut done = 0;
+    while done < to_len {
+        let n = from_len.min(to_len - done);
+        // SAFETY: the caller's vouching above; `std::ptr::copy` takes
+        // overlapping ranges.
+        unsafe { std::ptr::copy(from.add(from_len - n), to.add(done), n) };
+        done += n;
     }
 }
 
