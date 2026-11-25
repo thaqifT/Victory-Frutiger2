@@ -522,8 +522,8 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
     }
 }
 
-/// Buffer views left null because the host would refuse them
-/// ([`buffer_view_ok`]), since the start.
+/// Buffer views the host would refuse ([`buffer_view_ok`]) and that were made
+/// in its shape instead ([`fit_buffer_view`]), since the start.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether the host device is gone, and why (the first time it is asked
@@ -1775,6 +1775,56 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .is_some_and(|end| end <= width)
 }
 
+/// The nearest view the host makes to one [`buffer_view_ok`] refuses, keeping
+/// the bytes the view names. The title's heap holds views of no elements, of
+/// typeless formats without the raw flag, and structured views that also name
+/// a format: the console takes all of them and the host removes the device for
+/// one, so the view was left null and the draw read nothing from the slot —
+/// the black wedges across the frame (2026-11-25). A structured or typeless
+/// view becomes a raw view of the same bytes (the shader's own type reads
+/// them), a window past the buffer's end is cut to it, and no elements become
+/// one. Returns the format, first element, element count, stride and raw flag
+/// to make it with; `None` only for a format with no element at all.
+fn fit_buffer_view(
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    width: u64,
+) -> Option<(DXGI_FORMAT, u64, u32, u32, bool)> {
+    use crate::resource::family;
+    let f = format.0 as u32;
+    let typeless = f != 0 && family(f) == f && family(f + 1) == f;
+    if !raw && (stride > 0 || typeless) {
+        // The same bytes as dwords: the stride a structured view names, or
+        // the element a typeless format has not. Raw views start on a dword.
+        let element = u64::from(stride.max(4));
+        let start = first.checked_mul(element)?;
+        let bytes = u64::from(count.max(1)).checked_mul(element)?;
+        if start.is_multiple_of(4) && bytes.is_multiple_of(4) {
+            let dwords = (width / 4).max(1);
+            let at = (start / 4).min(dwords - 1);
+            let n = (bytes / 4).clamp(1, dwords - at);
+            if let Ok(n) = u32::try_from(n) {
+                return Some((DXGI_FORMAT_R32_TYPELESS, at, n, 0, true));
+            }
+        }
+    }
+    let element = if raw {
+        4
+    } else {
+        crate::resource::element(f).map_or(0, |(bytes, _)| bytes)
+    };
+    if element == 0 {
+        return None;
+    }
+    let elements = (width / element).max(1);
+    let at = first.min(elements - 1);
+    let n = u64::from(count.max(1)).min(elements - at);
+    u32::try_from(n).ok().map(|n| (format, at, n, 0, raw))
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -1817,7 +1867,11 @@ fn buffer_srv(
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+        // Left null before: the draw read nothing from the slot and drew
+        // garbage (black wedges). Make it in the shape the host takes.
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (fit_format, fit_first, fit_count, fit_stride, fit_raw) =
+            fit_buffer_view(desc.Format, first, count, stride, raw, width)?;
         once!(
             format = desc.Format.0,
             first,
@@ -1825,9 +1879,19 @@ fn buffer_srv(
             stride,
             raw,
             width,
-            "buffer view the host would refuse left null"
+            "buffer view the host would refuse, made in its shape instead"
         );
-        return None;
+        desc.Format = fit_format;
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        buffer.FirstElement = fit_first;
+        buffer.NumElements = fit_count;
+        buffer.StructureByteStride = fit_stride;
+        buffer.Flags = if fit_raw {
+            D3D12_BUFFER_SRV_FLAG_RAW
+        } else {
+            D3D12_BUFFER_SRV_FLAGS(0)
+        };
     }
     // The console has no component mapping; one the host does not know is the default's.
     if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
@@ -1897,7 +1961,10 @@ fn buffer_uav(
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+        // As in `buffer_srv`: made in the host's shape, not left null.
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (fit_format, fit_first, fit_count, fit_stride, fit_raw) =
+            fit_buffer_view(desc.Format, first, count, stride, raw, width)?;
         once!(
             format = desc.Format.0,
             first,
@@ -1905,9 +1972,19 @@ fn buffer_uav(
             stride,
             raw,
             width,
-            "unordered buffer view the host would refuse left null"
+            "unordered buffer view the host would refuse, made in its shape instead"
         );
-        return None;
+        desc.Format = fit_format;
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        buffer.FirstElement = fit_first;
+        buffer.NumElements = fit_count;
+        buffer.StructureByteStride = fit_stride;
+        if fit_raw {
+            buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        } else {
+            buffer.Flags = D3D12_BUFFER_UAV_FLAGS(0);
+        }
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
