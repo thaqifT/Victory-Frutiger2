@@ -557,7 +557,12 @@ impl Lanes {
         let lane = self.lanes.get_mut(&id)?;
         let &(seq, request) = lane.reads.front()?;
         let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        // A request larger than the whole staging buffer can never fit beside
+        // another one. Holding it back until the buffer empties starves it for
+        // as long as the pool keeps finding other work, which it always does
+        // during a stream-in; the title then waits for a status entry that
+        // never comes. It runs alone instead.
+        if staging <= self.staging && self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;

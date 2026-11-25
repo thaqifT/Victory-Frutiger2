@@ -26,10 +26,40 @@ pub fn run(
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    if !prepared.patches.is_empty() {
+        println!(
+            "patched        {}",
+            prepared
+                .patches
+                .iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // The patches only matter if the loader mapped them: read each back out
+    // of the mapped image, not the file we wrote.
+    for patch in &prepared.patches {
+        // SAFETY: the image is mapped at `base` for its whole virtual size,
+        // and every patch is inside it.
+        let mapped =
+            unsafe { std::slice::from_raw_parts((image.base() + patch.rva as usize) as *const u8, patch.bytes.len()) };
+        if mapped == patch.bytes {
+            println!("verified       {} at {:#x}", patch.name, image.base() + patch.rva as usize);
+        } else {
+            println!(
+                "NOT APPLIED    {} at {:#x}: mapped {:02X?}, wanted {:02X?}",
+                patch.name,
+                image.base() + patch.rva as usize,
+                mapped,
+                patch.bytes
+            );
+        }
+    }
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in

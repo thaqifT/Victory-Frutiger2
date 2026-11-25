@@ -22,6 +22,19 @@ pub struct PreparedImage {
     pub bytes: Vec<u8>,
     /// BLAKE3 of the original bytes: identifies the exact build.
     pub original_hash: blake3::Hash,
+    /// The title-side patches whose signature matched.
+    pub patches: Vec<AppliedPatch>,
+}
+
+/// A title-side patch that was applied, and enough to check it in the
+/// mapped image.
+#[derive(Debug, Clone)]
+pub struct AppliedPatch {
+    pub name: &'static str,
+    /// Address of the patched bytes in the image, relative to its base.
+    pub rva: u32,
+    /// What the bytes must read as once the image is mapped.
+    pub bytes: &'static [u8],
 }
 
 impl PreparedImage {
@@ -40,7 +53,8 @@ impl PreparedImage {
 /// * TLS callback pointer cleared: the OS still allocates static TLS for
 ///   the image, but callbacks only run when we call them (after binding);
 ///   its base relocation is made a no-op so the 0 survives a rebase;
-/// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned.
+/// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned;
+/// * the title's own code patched where `TITLE_PATCHES` matches.
 pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     let info = ImageInfo::parse(original)?;
     let mut bytes = original.to_vec();
@@ -106,12 +120,86 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         }
     }
 
+    // Title-side patches, last: they address code, not headers.
+    let mut patches = Vec::new();
+    for patch in TITLE_PATCHES {
+        let Some(at) = info.rva_to_file_offset(patch.rva) else {
+            continue;
+        };
+        let at = at as usize;
+        if bytes.get(at..at + patch.find.len()) == Some(patch.find) {
+            write(&mut bytes, at, patch.replace)?;
+            patches.push(AppliedPatch {
+                name: patch.name,
+                rva: patch.rva,
+                bytes: patch.replace,
+            });
+        }
+    }
+
     Ok(PreparedImage {
         info,
         bytes,
         original_hash: blake3::hash(original),
+        patches,
     })
 }
+
+/// A change to the title's own code, identified by a byte signature at a
+/// fixed RVA. A signature that does not match is left alone: the image is a
+/// different build, and patching a blind offset would corrupt code that
+/// happens to live there.
+struct TitlePatch {
+    name: &'static str,
+    rva: u32,
+    find: &'static [u8],
+    replace: &'static [u8],
+}
+
+/// The title's own GPU watchdog. It walks a table of outstanding GPU work
+/// (64 slots, 8 timestamps each) and aborts the process when an entry has
+/// been outstanding past a timeout calibrated for console hardware. This
+/// emulator runs the same work through a translation layer roughly an
+/// order of magnitude slower, so the timeout fires on work that is making
+/// normal progress: every run of the prologue died this way during its
+/// prestream, in every configuration tried.
+///
+/// Two changes, both inside the same function:
+///
+/// * the comparison's branch (`vucomiss %xmm7, %xmm8; jae <abort>`) becomes
+///   the comparison alone, so a stale entry no longer selects the abort;
+/// * the abort tail's null write becomes a jump to the function's epilogue,
+///   so if anything else in the title ever enters that tail the watchdog
+///   thread returns instead of taking the process down with it.
+const TITLE_PATCHES: &[TitlePatch] = &[
+    TitlePatch {
+        name: "gpu watchdog abort",
+        rva: 0x2215_bd8,
+        find: &[0xC5, 0x78, 0x2E, 0xC7, 0x73, 0x2E],
+        replace: &[0xC5, 0x78, 0x2E, 0xC7, 0x90, 0x90],
+    },
+    // `movl $0, 0` (eleven bytes) followed by the rest of the tail; the
+    // replacement jumps to the epilogue at 0x2215dce.
+    TitlePatch {
+        name: "gpu watchdog fatal tail",
+        rva: 0x2215_c35,
+        find: &[0xC7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0],
+        replace: &[0xE9, 0x94, 0x01, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90],
+    },
+    // The GPU location report's own exit: it encodes a signature, hands it
+    // to the reporter, wipes the buffer, and writes to a null address to
+    // make the crash reporter take a minidump. The write becomes the
+    // routine's return, so the report still happens and the process
+    // survives. The reporter is reached through one function pointer whose
+    // only reader is the watchdog tail above, so this is the same abort by
+    // another door.
+    TitlePatch {
+        name: "gpu loc report exit",
+        rva: 0x23cf_683,
+        find: &[0xC7, 0x04, 0x25, 0, 0, 0, 0, 0x21, 0xD4, 0x8B, 0x4D],
+        replace: &[0x48, 0x83, 0xC4, 0x48, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90],
+    },
+];
 
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;

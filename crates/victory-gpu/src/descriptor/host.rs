@@ -501,14 +501,26 @@ impl TextureQueue {
         let most_again = max.div_ceil(2);
         let mut order: Vec<(u32, u64)> = Vec::with_capacity(max.min(again.len() + fresh_order.len()));
         let (mut a, mut f) = (0, 0);
-        while order.len() < max && (a < again.len() || f < fresh_order.len()) {
+        // The turns end when either class runs out: `a` reaching `most_again`
+        // is not the same as `again` running out, and counting the loop on
+        // "something is left" spun forever once `fresh` emptied while `again`
+        // still had entries past the turn limit - the frame never finished
+        // (2026-11-25: 16,411 slots waiting for their memory, 1.1 cores, no
+        // wait in any thread).
+        while order.len() < max {
+            let mut served = false;
             if a < again.len() && a < most_again {
                 order.push((again[a].1, again[a].2));
                 a += 1;
+                served = true;
             }
             if order.len() < max && f < fresh_order.len() {
                 order.push((fresh_order[f].0, fresh_order[f].1));
                 f += 1;
+                served = true;
+            }
+            if !served {
+                break;
             }
         }
         order
