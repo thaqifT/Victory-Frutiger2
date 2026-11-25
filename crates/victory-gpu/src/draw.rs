@@ -842,13 +842,21 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::pipeline::note_why("a draw whose shader is skipped".to_owned());
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!(
+                "a draw with no host pipeline ({:#x})",
+                self.pipeline
+            ));
             return false;
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a draw with another kind of pipeline".to_owned());
             return false;
         }
         if p.rects && self.topology != RECTANGLES {
@@ -856,6 +864,8 @@ impl State {
             once!("a rectangle pipeline drawn with another topology");
         }
         if !self.bind(list, p, false) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a draw whose descriptors could not be bound".to_owned());
             return false;
         }
         let l = &list.list;
@@ -889,6 +899,11 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_why(format!(
+                    "an indexed draw whose index buffer {:#x} ({} bytes, format {}) is in no window",
+                    v.address, v.size, v.format
+                ));
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
