@@ -1775,18 +1775,6 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     ))
 }
 
-/// The console's `NUM_RECORDS` for `view`: how many records the part of the
-/// buffer it reads holds. A record is the view's stride, so a raw view (whose
-/// console stride is 1) counts bytes and a structured view counts elements.
-/// Code that walks a buffer by the view's address bounds the walk with this
-/// dword, so handing back bytes where records were asked for walks a
-/// structured view's stride times too far.
-pub(crate) fn buffer_records(view: &View) -> Option<u64> {
-    let (_, bytes) = buffer_range(view)?;
-    let stride = u64::from(view_stride(view)?).max(1);
-    Some(bytes / stride)
-}
-
 /// The title memory the host slot of buffer view `view` is made on
 /// (address, bytes): the whole buffer the view is of, which is what
 /// [`make`] finds the host copy by. [`buffer_range`] is the part of it the
