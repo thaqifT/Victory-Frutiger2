@@ -409,6 +409,10 @@ pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
 pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Where the pass's time over textures picked by index went, at the last
+/// pass: microseconds taking the ranges the runtime remapped, microseconds
+/// asking the queue what is due, and how many slots it handed over.
+static TEX_PHASE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Since the start: looks at a slot uploaded in part that found no more of
 /// its memory mapped; uploads of textures not all mapped; and of those,
 /// the ones whose first page was not there (asked by the first page alone,
@@ -1406,14 +1410,40 @@ impl State {
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
+        // `VICTORY_HEAP_FULL` sets the interval of the pass over every slot
+        // (16: the value before).
+        static FULL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let full = *FULL.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_FULL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16).max(1)
+        });
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        let whole_pass = *passes % full == 0;
+        // The pass over every slot is spread over `full` passes, a slice at a
+        // time: made all at once it was 776 and 1,359 ms in one frame after
+        // ten minutes in the open world (2026-11-25, run 7), and the title
+        // froze for it. A slot is still looked at once every `full` frames.
+        static ALL: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        static AT: AtomicU64 = AtomicU64::new(0);
+        let mut slots = changed;
+        if whole_pass {
+            *ALL.lock().unwrap_or_else(|e| e.into_inner()) = host.buffer_slots();
+        }
+        {
+            let all = ALL.lock().unwrap_or_else(|e| e.into_inner());
+            let n = all.len();
+            if n > 0 {
+                let chunk = n.div_ceil(full as usize).max(1);
+                let at = (AT.fetch_add(1, Ordering::Relaxed) as usize % full as usize) * chunk;
+                slots.extend(all[at.min(n)..(at + chunk).min(n)].iter().copied());
+            }
+        }
+        // A slot that changed and is in this pass's slice is looked at twice
+        // otherwise.
+        slots.sort_unstable();
+        slots.dedup();
         *passes += 1;
+        let slots_phase = std::time::Instant::now();
+        let slot_count = slots.len();
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1453,6 +1483,8 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        let slot_us = slots_phase.elapsed().as_micros() as u64;
+        let refresh_phase = std::time::Instant::now();
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1496,9 +1528,34 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        let refresh_us = refresh_phase.elapsed().as_micros() as u64;
+        let texture_phase = std::time::Instant::now();
         self.heap_textures(list, heap, host);
+        let texture_us = texture_phase.elapsed().as_micros() as u64;
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let total_us = started.elapsed().as_micros() as u64;
+        // A pass of 40 ms or more names where its time went: the slot sweep,
+        // the copies refreshed, or the textures picked by index.
+        if total_us >= 40_000 {
+            static SLOW: AtomicU64 = AtomicU64::new(0);
+            if SLOW.fetch_add(1, Ordering::Relaxed) < 400 {
+                tracing::info!(
+                    whole = whole_pass,
+                    slots = slot_count,
+                    kept = views,
+                    copies = spans.len(),
+                    us = total_us,
+                    slots_us = slot_us,
+                    refresh_us,
+                    texture_us,
+                    tex_remap_us = TEX_PHASE[0].load(Ordering::Relaxed),
+                    tex_queue_us = TEX_PHASE[1].load(Ordering::Relaxed),
+                    tex_due = TEX_PHASE[2].load(Ordering::Relaxed),
+                    "a pass over the heap's buffer views took 40 ms or more"
+                );
+            }
+        }
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
         let seen = LOGGED.load(Ordering::Relaxed);
@@ -1726,8 +1783,14 @@ impl State {
         let mut refused = 0;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
+        let remap_phase = std::time::Instant::now();
         host.texture_slots_remapped(frame);
+        let remap_us = remap_phase.elapsed().as_micros() as u64;
+        let queue_phase = std::time::Instant::now();
         let (due, census) = host.texture_slots_due(frame, 4096);
+        TEX_PHASE[1].store(queue_phase.elapsed().as_micros() as u64, Ordering::Relaxed);
+        TEX_PHASE[0].store(remap_us, Ordering::Relaxed);
+        TEX_PHASE[2].store(due.len() as u64, Ordering::Relaxed);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1761,16 +1824,27 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
+        //
+        // A third of the last frame, not a flat 250 ms: on a 300 ms frame a
+        // flat 250 ms was spent here and the frame stayed at 300 - the pass
+        // reported texture_us of 250,291, 250,412 and 250,755 in a row
+        // (2026-11-25, run 10), pinned at the budget with a backlog still
+        // due. A third is what a backlog may have and still leave the frame
+        // standing, and it settles: a shorter span makes a shorter frame,
+        // and the next span is a third of that. `VICTORY_TEXTURE_STAGE_MS`
+        // is the most it may be.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
+        let most_ms = *SPAN_MS.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-        }));
+        });
+        let span = std::time::Duration::from_millis((took / 3).clamp(8, most_ms.max(8)));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
-        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
-        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        // surfaces at 192 MB a frame) gets three times the bytes until it
+        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget. Not the
+        // time: a backlog is exactly when the frame cannot spare more of it.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let per_frame = if catchup && due.len() >= 1024 { per_frame * 3 } else { per_frame };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)

@@ -377,10 +377,50 @@ struct Waiting {
 #[derive(Default)]
 pub(crate) struct TextureQueue {
     slots: std::collections::BTreeMap<u32, Waiting>,
+    /// The same slots by the frame they are due at, so a pass touches only
+    /// the ones it can serve: 7,077 slots sat in the queue with 50 of them
+    /// due, and walking all of them for `due` and again for `census` cost
+    /// 21 ms of every frame. Every change to a slot goes through
+    /// [`TextureQueue::set`], which is what keeps this index and the two
+    /// counters below true.
+    parked: std::collections::BTreeMap<u64, std::collections::BTreeSet<u32>>,
+    /// Of `slots`: how many were uploaded with only part of their memory
+    /// there (`mapped > 0`), and how many are waiting for it to arrive
+    /// (`mapped == 0`, looked at at least once).
+    part: u64,
+    waiting: u64,
     writes: u64,
 }
 
 impl TextureQueue {
+    /// Puts `w` in the place of slot `index`'s entry (`None`: it leaves the
+    /// queue). The one way in or out: the due index and the counters stay
+    /// true only while every change goes through here.
+    fn set(&mut self, index: u32, w: Option<Waiting>) {
+        if let Some(old) = self.slots.remove(&index) {
+            if let Some(set) = self.parked.get_mut(&old.due) {
+                set.remove(&index);
+                if set.is_empty() {
+                    self.parked.remove(&old.due);
+                }
+            }
+            if old.mapped > 0 {
+                self.part = self.part.saturating_sub(1);
+            } else if old.looks > 0 {
+                self.waiting = self.waiting.saturating_sub(1);
+            }
+        }
+        if let Some(w) = w {
+            self.parked.entry(w.due).or_default().insert(index);
+            if w.mapped > 0 {
+                self.part += 1;
+            } else if w.looks > 0 {
+                self.waiting += 1;
+            }
+            self.slots.insert(index, w);
+        }
+    }
+
     /// A texture view was written into slot `index` in `frame`, due from
     /// frame `due`. `seen`: it was not written, a draw or the pass made
     /// the host slot from a view the queue may hold already, which then
@@ -391,11 +431,20 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.set(index, Some(Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) }));
     }
 
     fn remove(&mut self, index: u32) {
-        self.slots.remove(&index);
+        self.set(index, None);
+    }
+
+    /// Takes slot `index` out of the queue; whether it was there.
+    fn take(&mut self, index: u32) -> bool {
+        let had = self.slots.contains_key(&index);
+        if had {
+            self.set(index, None);
+        }
+        had
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -411,9 +460,15 @@ impl TextureQueue {
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+        for set in self.parked.range(..=frame).map(|(_, s)| s) {
+            for &index in set {
+                let Some(w) = self.slots.get(&index) else { continue };
+                if w.due > frame {
+                    continue;
+                }
+                let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+                class.push((w.written, index, w.write));
+            }
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
@@ -434,31 +489,33 @@ impl TextureQueue {
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
-    fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
-        self.slots.get_mut(&index).filter(|w| w.write == write)
+    fn same(&self, index: u32, write: u64) -> Option<Waiting> {
+        self.slots.get(&index).filter(|w| w.write == write).copied()
     }
 
     /// Slot `index` is up to date: out of the queue until written again.
     fn done(&mut self, index: u32, write: u64) {
         if self.same(index, write).is_some() {
-            self.slots.remove(&index);
+            self.set(index, None);
         }
     }
 
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(mut w) = self.same(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
+            self.set(index, Some(w));
         }
     }
 
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
     /// not all of it: looked at again from frame `due`.
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(mut w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            self.set(index, Some(w));
         }
     }
 
@@ -468,9 +525,10 @@ impl TextureQueue {
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(mut w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
+            self.set(index, Some(w));
         }
     }
 
@@ -488,7 +546,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.set(index, Some(Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) }));
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -501,16 +559,14 @@ impl TextureQueue {
     /// waiting for their memory (looked at, never uploaded); uploaded in
     /// part; and the frames the oldest due one has waited since its write.
     fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
-        for w in self.slots.values() {
-            if w.mapped > 0 {
-                c[3] += 1;
-            } else if w.looks > 0 {
-                c[2] += 1;
-            }
-            if w.due <= frame {
-                c[1] += 1;
-                c[4] = c[4].max(frame.saturating_sub(w.written));
+        let mut c = [self.slots.len() as u64, 0, self.waiting, self.part, 0];
+        for set in self.parked.range(..=frame).map(|(_, s)| s) {
+            for &index in set {
+                let Some(w) = self.slots.get(&index) else { continue };
+                if w.due <= frame {
+                    c[1] += 1;
+                    c[4] = c[4].max(frame.saturating_sub(w.written));
+                }
             }
         }
         c
@@ -1135,7 +1191,7 @@ impl HostHeap {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
+                if textures.take(index) {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }

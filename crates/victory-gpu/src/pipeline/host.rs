@@ -971,7 +971,25 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        let bytes = bytes.to_vec();
+        // One root signature object per description, kept for the run. The
+        // pipeline library compares the root signature a pipeline was
+        // stored with by identity: a second object holding the same bytes
+        // is a different root signature to it, and every load of a
+        // pipeline made with one is refused with 0x80070057 (run 8: every
+        // load refused, 269 to 4,652 ms of compiling for each).
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<[u8; 16], (ID3D12RootSignature, Vec<u8>)>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let key: [u8; 16] = blake3::hash(&bytes).as_bytes()[..16].try_into().unwrap();
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((root, blob)) = cache.get(&key) {
+            return Ok((root.clone(), blob.clone()));
+        }
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &bytes)?;
+        cache.insert(key, (root.clone(), bytes.clone()));
+        Ok((root, bytes))
     }
 }
 

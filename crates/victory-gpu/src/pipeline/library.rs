@@ -66,6 +66,8 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
+/// Stores the library refused, since the start.
+pub(crate) static STORE_REFUSED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
@@ -457,9 +459,7 @@ fn library() -> Option<&'static Library> {
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
-        unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
-        }
+        unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast() }
     };
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
@@ -558,8 +558,17 @@ pub(crate) fn pipeline(
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
+    match unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) } {
+        Ok(()) => {
+            library.added.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            // A store that fails leaves nothing to load: every pipeline
+            // then compiles again on every run, which is what run 8 did.
+            if STORE_REFUSED.fetch_add(1, Ordering::Relaxed) < 4 {
+                tracing::warn!(error = %e, name, "the pipeline library refused to keep a pipeline");
+            }
+        }
     }
     Ok(pso)
 }

@@ -348,6 +348,13 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// The last value the render queue was told to signal on the host's fence.
+/// The copy queue that fetches what shaders wrote waits for it before it
+/// reads: memory the title's shaders are writing may not be read while
+/// they write it, and waiting here costs the copy queue the wait instead of
+/// the thread that lands flights.
+static RENDER_SIGNALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The card's clock, for the frame line of every run, in microseconds since
 /// the last one: how long the card had nothing of ours queued; how much of
 /// that while the thread that holds the submission lock was working (the
@@ -1858,6 +1865,36 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Threads in [`relay_wait`]: with one, the thread that lands flights lands
+/// what is ready at once instead of batching it into a larger fetch.
+static RELAY_WAITERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The flights the thread that lands flights waits for before one fetch, and
+/// how long it holds them at most (`VICTORY_RELAY_BATCH`, 8;
+/// `VICTORY_RELAY_HOLD_US`, 5000).
+///
+/// Every landing is a round trip to the card: a fetch list, its fence and an
+/// event the landing thread blocks on, 11-14 ms each. Six or seven landings a
+/// frame were 85 ms of the 250 ms frame of 2026-11-25 (run 7, open world),
+/// for 65-86 MB that move in 5 ms of bandwidth. The card is idle 80% of the
+/// frame, so flights pile up behind a landing: batching takes the same bytes
+/// in one round trip and costs the card nothing.
+fn relay_batch() -> usize {
+    static BATCH: OnceLock<usize> = OnceLock::new();
+    *BATCH.get_or_init(|| {
+        std::env::var("VICTORY_RELAY_BATCH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).max(1)
+    })
+}
+
+fn relay_hold() -> std::time::Duration {
+    static HOLD: OnceLock<std::time::Duration> = OnceLock::new();
+    *HOLD.get_or_init(|| {
+        std::time::Duration::from_micros(
+            std::env::var("VICTORY_RELAY_HOLD_US").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5000),
+        )
+    })
+}
+
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
 /// how many, from the front, can be landed when the card has reached
@@ -2362,6 +2399,10 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     if done(&line) {
         return;
     }
+    // The thread that lands flights batches several flights into one fetch
+    // round trip while nothing is waiting for it: a caller in here is
+    // something waiting, and it is served at once.
+    RELAY_WAITERS.fetch_add(1, Ordering::Relaxed);
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
@@ -2369,6 +2410,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
+    RELAY_WAITERS.fetch_sub(1, Ordering::Relaxed);
     drop(line);
     stood(waiting);
     working(was_working);
@@ -2382,6 +2424,10 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
 /// behind the submission lock), and the memory the pieces come down to.
 struct RelayFetch {
+    /// A copy queue of this thread's: the fetch runs beside the render
+    /// queue's work instead of behind it. Waited for there, it cost 85 ms
+    /// of a 250 ms frame in 7.6 landings (2026-11-25, run 11).
+    queue: ID3D12CommandQueue,
     list: Prelude,
     fence: ID3D12Fence,
     event: HANDLE,
@@ -2389,6 +2435,70 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// The fetch submitted at the last landing and not waited for yet: see
+    /// [`Host::relay_card_back`].
+    pending: Option<PendingFetch>,
+}
+
+/// A fetch the landing thread submitted to the card and did not wait for:
+/// waiting for it where it was recorded was 110 ms of a 250 ms frame, in
+/// 6.4 waits that each sat behind the frame's own work on the card (the
+/// card was 65% busy by its own clock) (2026-11-25, run 10). Waited for at
+/// the next landing, it has run already.
+struct PendingFetch {
+    /// Each piece (the copy it lies in, its bytes there, where its bytes
+    /// came down). The copies are held here so they live until it has run.
+    pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>,
+    /// The bytes it brings down.
+    total: u64,
+    /// What had been sent up when it was submitted
+    /// ([`crate::shadow::relay_fetched`]).
+    after: u64,
+}
+
+impl RelayFetch {
+    /// Waits for the fetch recorded at the last landing, and merges what it
+    /// brought down into title memory.
+    fn collect(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        let waiting = std::time::Instant::now();
+        // SAFETY: the fence and the event are this thread's; the event was
+        // set for `pending.sent` when the fetch was submitted. A fetch of
+        // the last landing has run by now, so this returns at once; if the
+        // card never ran it, the wait is the only way to find out.
+        unsafe { WaitForSingleObject(self.event, INFINITE) };
+        let us = waiting.elapsed().as_micros() as u64;
+        RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+        {
+            use crate::shadow::CARD_STATS;
+            CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+        }
+        let Some((_, data, _)) = self.buffer.as_ref() else {
+            return;
+        };
+        let data = *data;
+        let mut title = Vec::new();
+        let mut written = 0;
+        for (shadow, lo, hi, at) in &pending.pieces {
+            // The pieces were laid out end to end in the buffer: one that
+            // would read past it is a bug, and reading it is the one way to
+            // find out.
+            if at.saturating_add((hi - lo) as u64) > pending.total {
+                continue;
+            }
+            // SAFETY: the mapping of the fetched bytes, `pending.total` of
+            // them; the copy into it has run.
+            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+            let merged = shadow.card_merge_relay(*lo, gpu, pending.after, &mut title);
+            shadow.walls_merged(gpu.len(), merged);
+            written += merged;
+        }
+        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        // Sends up to `after` are of no use to any later merge.
+        crate::shadow::relay_fetched(pending.after);
+    }
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -2406,11 +2516,13 @@ fn relay_worker() {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
     };
     let mut fetch: Option<RelayFetch> = None;
+    let mut hold: Option<std::time::Instant> = None;
     loop {
         let next = {
             let mut line = line();
             loop {
                 if line.line.is_empty() {
+                    hold = None;
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
@@ -2427,8 +2539,25 @@ fn relay_worker() {
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
+                    hold = None;
                     break Err(fences[0].unwrap_or(0));
                 }
+                // Batching ([`relay_batch`]): what the card has run is held
+                // for a moment so a later flight joins the same fetch, unless
+                // the whole line is ready (nothing to gain), enough flights
+                // are ready already, or a thread waits for a landing.
+                let ready = line.line[..n].iter().filter(|l| matches!(l, Late::Run(_))).count();
+                if n < line.line.len() && ready < relay_batch() && RELAY_WAITERS.load(Ordering::Relaxed) == 0 {
+                    let since = *hold.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() < relay_hold() {
+                        line = RELAY_MOVED
+                            .wait_timeout(line, std::time::Duration::from_micros(500))
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0;
+                        continue;
+                    }
+                }
+                hold = None;
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
                 line.in_hand = items
@@ -2892,14 +3021,16 @@ impl Host {
 
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
+        self.make_prelude_of(D3D12_COMMAND_LIST_TYPE_DIRECT)
+    }
+
+    /// A list of `kind` and its allocator.
+    fn make_prelude_of(&self, kind: D3D12_COMMAND_LIST_TYPE) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
             (|| {
-                let allocator: ID3D12CommandAllocator =
-                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-                let list: ID3D12GraphicsCommandList =
-                    self.device
-                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(kind)?;
+                let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(0, kind, &allocator, None)?;
                 list.Close()?;
                 Ok((allocator, list))
             })()
@@ -3319,17 +3450,26 @@ impl Host {
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
-        let list = self.make_prelude()?;
+        let list = self.make_prelude_of(D3D12_COMMAND_LIST_TYPE_COPY)?;
         // SAFETY: plain objects of our own.
         unsafe {
+            let queue: ID3D12CommandQueue = self
+                .device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                    ..Default::default()
+                })
+                .ok()?;
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
+                queue,
                 list,
                 fence,
                 event,
                 sent: 0,
                 buffer: None,
+                pending: None,
             })
         }
     }
@@ -3344,7 +3484,13 @@ impl Host {
     /// whatever was sent meanwhile, so it may bring a later flight's
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
-    fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+    fn relay_card_back(&self, plans: &[&CardPlan], landed: u64, fetch: &mut Option<RelayFetch>) {
+        // What the fetch of the last landing brought down: waited for now,
+        // when it has run, and merged. It has to be done before the list is
+        // used again, and before the buffer is recorded into again.
+        if let Some(f) = fetch.as_mut() {
+            f.collect();
+        }
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -3400,15 +3546,16 @@ impl Host {
             let size = total.next_multiple_of(16 << 20);
             f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
-        let Some((buffer, data, _)) = f.buffer.clone() else {
+        let Some((buffer, _data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
         f.sent += 1;
-        let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
-        let waiting = std::time::Instant::now();
-        // SAFETY: the list's last run was waited for by this thread; live
-        // buffers (the copies are held by the plans); the fence and the
-        // event are this thread's.
+        let ((allocator, list), fqueue, fence, event, sent) =
+            (f.list.clone(), f.queue.clone(), f.fence.clone(), f.event, f.sent);
+        // SAFETY: the list's last run was waited for (`collect`, above);
+        // live buffers (the copies are held by the plans, and by the
+        // pending fetch until it has run); the fence and the event are this
+        // thread's.
         let ran = unsafe {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
@@ -3418,16 +3565,34 @@ impl Host {
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
-                // In the order of the queue: the sends of title bytes so
-                // far are ahead of this fetch, every later one behind it.
+                // The copy queue reads memory the title's shaders wrote. The
+                // flights being landed have run (the landing thread saw
+                // their fence values reached), so the wait named below is
+                // already met; it is kept for the ordering it states, not
+                // for the time it costs. `RENDER_SIGNALLED` — the newest
+                // submission — is deliberately not used: it is a whole
+                // frame further on.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
+                let render = landed;
                 let after = *order;
                 drop(order);
-                self.card_sent();
-                self.queue.Signal(&fence, sent)?;
+                // Only as far as the flights being landed: the landing
+                // thread has already seen their fence value reached
+                // (`landable`), so this is met, and the fetch runs while
+                // the frame just submitted is still on the card. Waiting
+                // for `RENDER_SIGNALLED` (the newest submission) put the
+                // fetch behind the whole frame: 60.8 ms of a 250 ms frame
+                // in 9.8 landings (2026-11-25, run 12). The hazard that
+                // leaves — a later submission writing the same bytes
+                // while the copy queue reads them — is the one the relay
+                // already lives with, and a later flight's landing merges
+                // its bytes anyway.
+                if render != u64::MAX {
+                    fqueue.Wait(&self.fence, render)?;
+                }
+                fqueue.ExecuteCommandLists(&lists);
+                fqueue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
                 Ok(after)
             })()
         };
@@ -3435,28 +3600,18 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
-        let us = waiting.elapsed().as_micros() as u64;
-        RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
             use crate::shadow::CARD_STATS;
             CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
-            CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
+        // Not waited for here: the next landing collects it
+        // (`RelayFetch::collect`), when the card has run it. Its pieces hold
+        // their copies, and the buffer stays as it is until then.
+        if let Some(f) = fetch.as_mut() {
+            f.pending = Some(PendingFetch { pieces, total, after });
         }
-        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-        // Sends up to `after` are of no use to any later merge.
-        crate::shadow::relay_fetched(after);
     }
 
     /// [`relay`], on the thread that lands flights: `items` are the first
@@ -3490,7 +3645,8 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
-                self.relay_card_back(&plans, fetch);
+                let landed = flights.iter().map(|f| f.fence).max().unwrap_or(0);
+                self.relay_card_back(&plans, landed, fetch);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -3643,6 +3799,7 @@ impl Host {
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
+                    RENDER_SIGNALLED.store(*submitted, Ordering::Relaxed);
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -4103,6 +4260,7 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            RENDER_SIGNALLED.store(*submitted, Ordering::Relaxed);
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
@@ -4143,6 +4301,7 @@ impl Host {
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                RENDER_SIGNALLED.store(*submitted, Ordering::Relaxed);
                 match waited {
                     Ok(()) => {
                         working(false);
