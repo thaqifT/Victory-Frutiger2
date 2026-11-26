@@ -1628,11 +1628,19 @@ impl HostHeap {
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
             // here when a draw reads the slot through a table.
-            let waiting = if for_draw { None } else { view.waiting_texture() };
+            //
+            // A draw's own bind waits too. The title writes a texture's
+            // views into its heap once, when it creates the texture, and a
+            // translated shader indexes the heap directly: a slot left
+            // null here was never written again, and every draw of that
+            // texture read nothing for the rest of the run (a black head
+            // among lit shoulders). The slot is made null for this list
+            // and `make_waiting` makes it the moment the texture is.
+            let waiting = view.waiting_texture();
             if let Some(texture) = waiting {
                 super::wait_for(texture, handle);
             }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            let later = waiting.is_some() || (!for_draw && view.is_buffer());
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
