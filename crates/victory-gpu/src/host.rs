@@ -6321,8 +6321,9 @@ impl Meter {
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
-                "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
-                crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
+                "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made); {} reads of a slot whose placed texture the host had no copy of yet (tried again by the next draw)",
+                crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed),
+                crate::descriptor::host::PLACED_RETRIED.load(Ordering::Relaxed)
             );
             {
                 let [calls, us, longest] = crate::host::mapped_stats();

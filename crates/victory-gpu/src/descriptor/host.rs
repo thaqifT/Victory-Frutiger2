@@ -1656,12 +1656,21 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
-            made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
             } else {
                 make(&view, self.cpu(index))
             };
+            // A shader view of a texture the title placed in memory itself
+            // whose memory the host has no copy of yet (not streamed in, or
+            // placed after this slot was written) is tried again by the next
+            // draw that reads the slot. Recorded as made, it read nothing for
+            // the rest of the run: the title writes a slot once.
+            let retry = kept.is_none() && matches!(view, View::Placed(false, _, _));
+            if retry {
+                PLACED_RETRIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            made[index as usize] = if later || retry { 0 } else { key };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -2522,6 +2531,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 /// Writes of a slot with another view of the placed texture it showed,
 /// since the start: the slot kept showing the old view.
 pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Draws that read a slot whose placed texture the host had no copy of yet,
+/// since the start: the slot is left unmade and tried again by the next one.
+pub(crate) static PLACED_RETRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a slot written with another view of the placed texture it
 /// shows keeps showing the old one until the new is made;
