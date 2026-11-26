@@ -3005,6 +3005,42 @@ impl State {
         out
     }
 
+    /// Whether `VICTORY_SKIP_SHADERS` names this draw's pipeline: a
+    /// comma-separated list of shader hashes, matched against the
+    /// pipeline's name (which carries `[vertex <hash>, pixel <hash>]`).
+    ///
+    /// A diagnostic for bisecting a post-processing chain: a pass left out
+    /// keeps its target as it was, so what it contributes is seen by its
+    /// absence. It is not a fix: the target then holds the previous frame.
+    fn skipped(&self) -> bool {
+        static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let list = LIST.get_or_init(|| {
+            std::env::var("VICTORY_SKIP_SHADERS")
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_ascii_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        if list.is_empty() {
+            return false;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        let name = p.name.to_ascii_lowercase();
+        let hit = list.iter().any(|h| name.contains(h.as_str()));
+        if hit {
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+                tracing::info!(pipeline = %p.name, "draws: skipped by VICTORY_SKIP_SHADERS");
+            }
+        }
+        hit
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -3016,7 +3052,7 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let ready = self.prepare(list, false);
+        let ready = self.prepare(list, false) && !self.skipped();
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
