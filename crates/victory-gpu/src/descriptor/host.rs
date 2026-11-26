@@ -2597,6 +2597,16 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
 
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
+///
+/// `VICTORY_PLACED_TRACE=1` names each placed texture the first time it is
+/// resolved, with the description the title gave it: what the sky, the
+/// probes and the bounced light read is one of these, and when the copy is
+/// made from title memory instead of found among the host's own textures
+/// the shader reads what nothing wrote.
+///
+/// `VICTORY_PLACED_NULL=<hex>[,<hex>...]` leaves the named ones unresolved:
+/// their slots stay null and read zeros, which says whether an image comes
+/// from one of them.
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {
@@ -2606,8 +2616,57 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    if placed_nulled(address) {
+        return None;
+    }
     let texture = crate::resource::texture_at(address, resource)?;
+    if let Some(seen) = placed_trace() {
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert(address) {
+            let width = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            tracing::info!(
+                address = format_args!("{address:#x}"),
+                made = format_args!("{:#x}", texture as usize),
+                width,
+                height = resource[6],
+                levels = resource[7] & 0xffff,
+                layers = resource[7] >> 16,
+                format = resource[8],
+                "a placed texture is resolved from title memory"
+            );
+        }
+    }
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+}
+
+/// The placed textures named to be left null (`VICTORY_PLACED_NULL`).
+fn placed_nulled(address: u64) -> bool {
+    static NULLS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    NULLS
+        .get_or_init(|| {
+            std::env::var("VICTORY_PLACED_NULL")
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|s| {
+                            u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .contains(&address)
+}
+
+/// The addresses already named, when `VICTORY_PLACED_TRACE` is set.
+fn placed_trace() -> Option<&'static std::sync::Mutex<std::collections::BTreeSet<u64>>> {
+    static SEEN: std::sync::OnceLock<Option<std::sync::Mutex<std::collections::BTreeSet<u64>>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| {
+        std::env::var_os("VICTORY_PLACED_TRACE")
+            .is_some_and(|v| v != "0")
+            .then(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+    })
+    .as_ref()
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host

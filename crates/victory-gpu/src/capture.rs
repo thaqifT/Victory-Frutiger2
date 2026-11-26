@@ -301,6 +301,7 @@ fn prune_keeping(folder: &std::path::Path, floor: usize) {
     }
     files.sort();
     let drop = files.len() - keep;
+    tracing::info!(files = files.len(), keep, floor, drop, "captures: pruning");
     for (_, p) in files.into_iter().take(drop) {
         let _ = std::fs::remove_file(p);
     }

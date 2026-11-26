@@ -72,11 +72,24 @@ pub(crate) fn on() -> bool {
     level() > 0.0 && !crate::pipeline::builder_runs()
 }
 
+/// Whether the image takes the stand-in outright, keeping none of what the
+/// title's program left (`VICTORY_AMBIENT_REPLACE=1`). With no rays that
+/// program leaves the probes' uninitialised memory: bright, and of a hue
+/// nothing in the scene has. Bounding its brightness keeps the hue (it is
+/// scaled, not dropped), so the picture still carries the blocks; taking
+/// the stand-in in its place drops them with it.
+pub(crate) fn replace() -> bool {
+    static REPLACE: OnceLock<bool> = OnceLock::new();
+    *REPLACE.get_or_init(|| {
+        std::env::var_os("VICTORY_AMBIENT_REPLACE").is_some_and(|v| v == "1")
+    })
+}
+
 const SOURCE: &str = r#"
 // A typed UAV cannot be a root descriptor; it comes through a table.
-#define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(UAV(u0))"
+#define RS "RootConstants(num32BitConstants=5, b0), DescriptorTable(UAV(u0))"
 cbuffer Set : register(b0) {
-    float level; float most; uint width; uint height;
+    float level; float most; uint width; uint height; uint replace;
 };
 // The diffuse light: R9G9B9E5, one word a texel.
 RWTexture2D<uint> light : register(u0);
@@ -101,6 +114,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
     uint2 p = at.xy;
     float3 found = float3(1.0, 0.98, 0.94) * level;
+    if (replace) {
+        light[p] = pack(found);
+        return;
+    }
     // What the program left counts as far as it can be true. Without rays
     // it is the probes' uninitialised memory in blocks of tiles, brighter
     // than anything in the scene: unbounded, it is the picture.
@@ -169,7 +186,13 @@ pub(crate) fn after(list: &HostList, image: &Image) -> bool {
     if width == 0 || height == 0 {
         return false;
     }
-    let words = [level.to_bits(), most().to_bits(), width, height];
+    let words = [
+        level.to_bits(),
+        most().to_bits(),
+        width,
+        height,
+        u32::from(replace()),
+    ];
     // SAFETY: an open list with the heap of the view set; the title's
     // program has just written the image, so it is in the state the view
     // needs.
@@ -181,7 +204,7 @@ pub(crate) fn after(list: &HostList, image: &Image) -> bool {
         };
         l.ResourceBarrier(&[barrier()]);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 4, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 5, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, image.view);
         l.SetPipelineState(&pass.raise);
         l.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
@@ -189,7 +212,7 @@ pub(crate) fn after(list: &HostList, image: &Image) -> bool {
     }
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::info!(level, size = ?image.size, "a stand-in for the indirect light");
+        tracing::info!(level, replace = replace(), size = ?image.size, "a stand-in for the indirect light");
     }
     true
 }

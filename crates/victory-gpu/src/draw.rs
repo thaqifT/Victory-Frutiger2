@@ -3505,6 +3505,32 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            #[cfg(feature = "diagnostics")]
+            if placed.is_some() {
+                let d = crate::resource::host_resource(*resource as This).map(|t| {
+                    // SAFETY: a live resource.
+                    unsafe { t.GetDesc() }
+                });
+                // The light the sky, the probes and the bounced light read
+                // is a full-screen texture: those are the ones whose
+                // contents the title's compute programs write, so whether
+                // the host found them is the question. Small tables are
+                // filled by the title itself and always read from memory.
+                let big = d
+                    .as_ref()
+                    .is_some_and(|d| d.Width >= 512 || d.Height >= 512);
+                static NAMED: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if big && NAMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                    tracing::info!(
+                        resource = format_args!("{:#x}", *resource as usize),
+                        aliased,
+                        size = ?d.as_ref().map(|d| (d.Width, d.Height)),
+                        format = ?d.as_ref().map(|d| d.Format.0),
+                        "a placed view is read"
+                    );
+                }
+            }
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)

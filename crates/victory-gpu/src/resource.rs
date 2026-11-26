@@ -1242,6 +1242,33 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+    if !same && r.desc.sample_count <= 1 {
+        // What shaders wrote is on the card in the other texture; this one
+        // is filled from title memory, which they never reached. Each kind
+        // of pair is said once.
+        static SAID: std::sync::Mutex<std::collections::BTreeSet<[u32; 6]>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let pair = [
+            r.desc.width as u32,
+            r.desc.height,
+            r.desc.format,
+            o.desc.width as u32,
+            o.desc.height,
+            o.desc.format,
+        ];
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        if said.len() < 64 && said.insert(pair) {
+            tracing::warn!(
+                view = ?pair,
+                levels = format_args!("{} and {}", r.desc.mip_levels, o.desc.mip_levels),
+                layers = format_args!(
+                    "{} and {}",
+                    r.desc.depth_or_array_size, o.desc.depth_or_array_size
+                ),
+                "a placed texture lies where one the host writes does, and is not like it (width, height, format of each)"
+            );
+        }
+    }
     same.then_some(other)
 }
 

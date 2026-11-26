@@ -883,6 +883,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         source
     };
     into_destination(request, size, |out| match tables {
+        // `VICTORY_BCPACK_OFF=1` leaves the destination as it is instead of
+        // unpacking: the textures it would have filled stay zero, so a run
+        // with and without it tells whether what is on screen came out of
+        // this decoder.
+        Some(_) if bcpack_off() => Ok(out.len()),
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
@@ -895,6 +900,12 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         "dstorage: request done"
     );
     Ok(())
+}
+
+/// Whether the BCPack decoder is left out (`VICTORY_BCPACK_OFF=1`).
+fn bcpack_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("VICTORY_BCPACK_OFF").is_some_and(|v| v == "1"))
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
