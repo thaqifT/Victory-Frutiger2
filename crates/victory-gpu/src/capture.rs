@@ -265,18 +265,25 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
 /// `VICTORY_CAPTURE_KEEP` (default 160) are left. A menu boot at 30 fps makes
 /// six pictures a second and those stop being worth looking at the moment the
 /// world starts, so the window is a rolling one rather than a per-run count.
-/// Only the present path prunes: a target dump writes every target of one
-/// frame at once and must not delete the earlier ones of its own frame.
+/// A target dump calls it too, with `floor` the number of pictures it just
+/// wrote: one frame of every target is 200-1,200 files, and a keep smaller
+/// than that would delete the frame it was called for.
 fn prune(folder: &std::path::Path) {
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
     static SINCE: AtomicU32 = AtomicU32::new(0);
     if !SINCE.fetch_add(1, Relaxed).is_multiple_of(16) {
         return;
     }
+    prune_keeping(folder, 0);
+}
+
+/// [`prune`] with a floor under the keep count.
+fn prune_keeping(folder: &std::path::Path, floor: usize) {
     let keep: usize = std::env::var("VICTORY_CAPTURE_KEEP")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(160);
+        .unwrap_or(160)
+        .max(floor);
     if keep == 0 {
         return;
     }
@@ -505,6 +512,19 @@ pub(crate) fn dump_targets(frame: u64) {
         let state = copy.state.load(Relaxed);
         dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
     }
+    // One frame of every target is hundreds of files: left alone across a
+    // run that dumps every 16th frame the folder is tens of thousands. The
+    // frame just written is the floor, so it is never the one removed.
+    let Some(folder) = folder() else { return };
+    let prefix = format!("frame-{frame}-");
+    let written = std::fs::read_dir(folder)
+        .map(|dir| {
+            dir.filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+                .count()
+        })
+        .unwrap_or(0);
+    prune_keeping(folder, written);
 }
 
 fn dump_one(
