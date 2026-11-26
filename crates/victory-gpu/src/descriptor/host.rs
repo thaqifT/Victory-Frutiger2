@@ -1673,6 +1673,23 @@ impl HostHeap {
             made[index as usize] = if later || retry { 0 } else { key };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
+                // Diagnostic: the first slots left null, with what they hold.
+                // A surface that stays black while its neighbours are lit is
+                // one of these.
+                #[cfg(feature = "diagnostics")]
+                {
+                    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+                    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                    if seen.len() < 60 && !seen.contains(&index) {
+                        seen.push(index);
+                        tracing::warn!(
+                            index,
+                            distinct = seen.len(),
+                            view = ?format_args!("{view:?}"),
+                            "a host slot is left null"
+                        );
+                    }
+                }
             }
             self.keep(index, kept.flatten());
         }
@@ -2696,6 +2713,29 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         return null_view(at);
     }
     let Some(host) = host() else { return };
+    // Diagnostic (`VICTORY_NULL_MAGENTA=1`; off by default): a null 2D view
+    // shows magenta instead of reading zeros, so a surface that is black
+    // because its texture never arrived can be told from one that is black
+    // because of its shading. 2D only: the other dimensions are mismatches.
+    if words[1] == 4 && null_magenta() && let Some(texture) = magenta_texture() {
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a slot of our heap, a live texture, and a desc it fits.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(&texture, Some(&desc), at);
+        }
+        return;
+    }
     // One mip, one slice or cube, plane 0: fields a null view still checks.
     let mut w = [0u32; 10];
     w[1] = words[1];
@@ -2713,6 +2753,68 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// Whether a null 2D view shows magenta instead of reading zeros
+/// (`VICTORY_NULL_MAGENTA=1`; off by default).
+#[cfg(windows)]
+fn null_magenta() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NULL_MAGENTA").is_some_and(|v| v == "1"))
+}
+
+/// The 1x1 magenta texture a null 2D view shows under
+/// [`null_magenta`], made once.
+#[cfg(windows)]
+fn magenta_texture() -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    static MADE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let host = host()?;
+        // SAFETY: our own description and out pointer; the mapped pointer is
+        // ours while the resource is alive.
+        unsafe {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+            };
+            // An upload heap texture can be read through a view, and takes
+            // its texel by mapping rather than a copy.
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut texture,
+                )
+                .ok()?;
+            let texture = texture?;
+            let mut at: *mut std::ffi::c_void = std::ptr::null_mut();
+            texture.Map(0, None, Some(&mut at)).ok()?;
+            std::ptr::copy_nonoverlapping([255u8, 0, 255, 255].as_ptr(), at.cast::<u8>(), 4);
+            texture.Unmap(0, None);
+            Some(texture)
+        }
+    })
+    .clone()
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.

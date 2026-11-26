@@ -2350,6 +2350,22 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         &mut out,
     );
     if made != S_OK {
+        // Diagnostic: a placed texture the host could not give a resource
+        // for. Its views read nothing (the surface stays black or unlit).
+        static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static SEEN: std::sync::Mutex<Vec<(u64, [u32; 14])>> = std::sync::Mutex::new(Vec::new());
+        let n = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() < 40 && !seen.contains(&(address, *desc)) {
+            seen.push((address, *desc));
+            tracing::warn!(
+                address = format_args!("{address:#x}"),
+                hr = format_args!("{made:#x}"),
+                desc = ?desc,
+                distinct = seen.len(),
+                "a placed texture the host could not make a resource for"
+            );
+        }
         return None;
     }
     map.insert((address, *desc), out as usize);
