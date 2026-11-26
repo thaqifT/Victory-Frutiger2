@@ -308,6 +308,33 @@ fn packed_add_selects_halves_of_inline_constants() {
     }
 }
 
+#[test]
+fn add_lshl_shifts_only_its_second_source() {
+    // v_add_lshl_u32 is S0 + (S1 << S2); v_lshl_add_u32 is (S0 << S1) + S2.
+    // The two are one opcode apart and the same three-source shape, so a
+    // swap is silent: an address computed with the wrong one lands off by a
+    // factor of two per shift.
+    let cases = [
+        // v_add_lshl_u32 v0, v1, v2, 2
+        ([0x0000_0007, 0x0000_0003, 0, 0], 0x7 + (0x3 << 2), 0x347, 130),
+        // v_add_lshl_u32 v0, v1, v2, 0 (no shift: plain add)
+        ([0x1234_5678, 0x0000_0001, 0, 0], 0x1234_5679, 0x347, 128),
+    ];
+    for (inputs, expected, op, sh) in cases {
+        let words = vop3(op, 0, vgpr(1), vgpr(2), sh);
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &[inputs], |backend, _, _, got| {
+            assert_eq!(got, expected, "{backend}: {words:08x?}");
+        });
+    }
+    // v_lshl_add_u32 v0, v1, v2, v3 = (a << b) + c
+    let words = vop3(0x346, 0, vgpr(1), vgpr(2), vgpr(3));
+    let shader = build_valu_cs(&words);
+    run_cases(&shader, &[[3, 4, 5, 0]], |backend, _, _, got| {
+        assert_eq!(got, (3 << 4) + 5, "{backend}: {words:08x?}");
+    });
+}
+
 /// The float `v_cvt_f32_f64` gives for `x`: Rust's rounding (to nearest
 /// even), with results below the smallest normal float flushed to signed
 /// zero as the console's default float mode does.

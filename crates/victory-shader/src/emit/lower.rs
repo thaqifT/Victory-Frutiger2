@@ -8798,9 +8798,11 @@ impl<'a> Lower<'a> {
                         self.s.m.bin(c, op, t, d)
                     }
                     "v_add_lshl_u32" => {
-                        let t = self.s.m.bin(c, Bin::Add, a, b);
+                        // D = S0 + (S1 << S2): the shift applies to the second
+                        // source only, unlike `v_lshl_add_u32`'s (S0 << S1) + S2.
                         let d = m31(self, d);
-                        self.s.m.bin(c, Bin::Shl, t, d)
+                        let t = self.s.m.bin(c, Bin::Shl, b, d);
+                        self.s.m.bin(c, Bin::Add, a, t)
                     }
                     _ => {
                         let (o1, o2) = match name {
