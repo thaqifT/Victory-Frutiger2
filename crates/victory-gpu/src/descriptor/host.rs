@@ -2425,6 +2425,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
+                // The ordinary textures a shader samples, which
+                // `VICTORY_DUMP_SAMPLED` saves: the placed ones are noted when
+                // they are resolved, these are what most passes read.
+                #[cfg(all(windows, feature = "diagnostics"))]
+                crate::capture::note_sampled(resource);
                 // The title's views of textures with a stencil plane, as it
                 // describes them (format, dimension, component mapping, a
                 // pad, then first level, levels, plane): each distinct one

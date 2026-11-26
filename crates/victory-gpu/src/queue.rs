@@ -826,6 +826,21 @@ extern "system" fn present(
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+        // The picture on screen is the title's own resource, and the frame
+        // listing names targets by address: without this line the presented
+        // resource cannot be found in it, so the pass that fills it cannot be
+        // named. Only for the frames being dumped.
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::dumping(frame) {
+            let d = unsafe { texture.GetDesc() };
+            tracing::info!(
+                resource = format_args!("{:#x}", resource as usize),
+                width = d.Width,
+                height = d.Height,
+                format = d.Format.0,
+                "the presented resource"
+            );
+        }
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);

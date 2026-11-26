@@ -632,6 +632,37 @@ impl State {
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
+        // The frame listing has carried every bound shader view since the
+        // start and no render target, so a dumped target could not be traced
+        // back to the pass that wrote it. The line names each target's
+        // resource, size and format; the draw that follows names its shader.
+        #[cfg(feature = "diagnostics")]
+        {
+            let depth = self.depth;
+            crate::capture::op(std::ptr::from_ref(list) as usize, || {
+                use std::fmt::Write;
+                let mut text = String::from("targets");
+                for &t in &self.targets {
+                    text.push(' ');
+                    match crate::resource::host_resource(t as crate::object::This) {
+                        // SAFETY: a live texture.
+                        Some(texture) => {
+                            let d = unsafe { texture.GetDesc() };
+                            let _ = write!(
+                                text,
+                                "{t:#x} {}x{} f{}",
+                                d.Width, d.Height, d.Format.0
+                            );
+                        }
+                        None => text.push_str("no-host-copy"),
+                    }
+                }
+                if depth != 0 {
+                    let _ = write!(text, " depth {depth:#x}");
+                }
+                text
+            });
+        }
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
