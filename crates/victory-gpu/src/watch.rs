@@ -462,7 +462,16 @@ const BLOCK: usize = PAGE;
 /// Where a frame's guarding goes: calls to [`guard`], blocks it stood on
 /// (not skipped as a clean run), calls to [`protect`], and blocks those
 /// covered. Since the last frame-rate line.
-pub(crate) static GUARD_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static GUARD_STATS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// What the rest of [`GUARD_STATS`] says, in nanoseconds and counts:
+/// `[4]` calls that had to ask Windows whether the range is a view, `[5]`
+/// the held-block probe, `[6]` [`is_view`], `[7]` the walk and its protects,
+/// `[8]` the part of the walk spent inside [`protect`], `[9]` asks to
+/// [`uncommitted_end`].
+fn guard_stat(i: usize, n: u128) {
+    GUARD_STATS[i].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+}
 
 struct Guards {
     /// Blocks we made read-only.
@@ -552,14 +561,23 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let t0 = std::time::Instant::now();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first)
     };
-    if !known && !is_view(start, end) {
-        return None;
+    guard_stat(5, t0.elapsed().as_nanos());
+    let t1 = std::time::Instant::now();
+    if !known {
+        GUARD_STATS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !is_view(start, end) {
+            guard_stat(6, t1.elapsed().as_nanos());
+            return None;
+        }
     }
+    guard_stat(6, t1.elapsed().as_nanos());
+    let t2 = std::time::Instant::now();
     install();
     let mut g = guards();
     let mut written = Vec::new();
@@ -569,6 +587,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // The range lies inside one clean run: nothing written, mapped or new
     // since it was last taken.
     if all_clean(&g, first, last) {
+        guard_stat(7, t2.elapsed().as_nanos());
         return Some(written);
     }
     // Blocks of a clean run are skipped whole, by one lookup, not one at a
@@ -619,6 +638,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     if let Some(from) = run.take() {
         protect(&mut g, from, last);
     }
+    guard_stat(7, t2.elapsed().as_nanos());
     Some(written)
 }
 
@@ -672,6 +692,8 @@ fn is_view(start: usize, end: usize) -> bool {
 fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     GUARD_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    let t = std::time::Instant::now();
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.

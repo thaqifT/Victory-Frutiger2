@@ -2448,7 +2448,18 @@ impl Shadow {
         // Refreshed already under this submission's one asking, over a range
         // that covers this one: the journal's answer is the one it gave, and
         // we have written nothing since (our own writes are counted).
-        if let Some((asking, own)) = crate::watch::standing() {
+        //
+        // Only for memory the guards hold: a write there traps, and the
+        // handler journals it whatever the asking count says. Plain watched
+        // memory journals nothing — a write is found by asking the kernel
+        // again, and the asking count is what would have changed had we
+        // asked. Skipping the ask then leaves the copy stale for good: the
+        // `VICTORY_REFRESH_CHECK` run (`cam`) named 72 ranges, 4 MiB and
+        // 11 MiB buffers among them, "the memory changed with nothing to
+        // tell of it", three refreshes running.
+        if self.guarded()
+            && let Some((asking, own)) = crate::watch::standing()
+        {
             let settled = self.settled.lock().unwrap_or_else(|e| e.into_inner());
             if settled.0 == asking && settled.1 == own && settled.2 <= from && to <= settled.3 {
                 drop(settled);
