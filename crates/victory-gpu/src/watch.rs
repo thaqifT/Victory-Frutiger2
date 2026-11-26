@@ -467,8 +467,8 @@ pub(crate) static GUARD_STATS: [std::sync::atomic::AtomicU64; 10] = [const { std
 /// What the rest of [`GUARD_STATS`] says, in nanoseconds and counts:
 /// `[4]` calls that had to ask Windows whether the range is a view, `[5]`
 /// the held-block probe, `[6]` [`is_view`], `[7]` the walk and its protects,
-/// `[8]` the part of the walk spent inside [`protect`], `[9]` asks to
-/// [`uncommitted_end`].
+/// `[8]` the part of the walk spent inside [`protect`], `[9]` blocks the
+/// walk looked at one by one (the gaps between clean runs).
 fn guard_stat(i: usize, n: u128) {
     GUARD_STATS[i].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 }
@@ -590,50 +590,63 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         guard_stat(7, t2.elapsed().as_nanos());
         return Some(written);
     }
-    // Blocks of a clean run are skipped whole, by one lookup, not one at a
-    // time: the frame checks some 7 GB of view memory, 1.7 million blocks,
-    // and 99% of them are clean (run `guarded`: 17-20 ms of the copies
-    // phase, which is the walk itself). Only the blocks that are not clean
-    // are stood on, and those are the ones a copy has to take.
+    // Clean runs are found by asking `runs` where the next one begins, not
+    // by a lookup per block: the frame checks some 7 GB of view memory, 1.7
+    // million blocks, and 99% of them are clean. Looking each block up took
+    // 9-10 us a call over only nine blocks stood on (run `cam`: 1,888 calls,
+    // 17.3 ms of the copies phase) — the walk was the per-block lookup, not
+    // the blocks it stopped at. Now the gaps between runs are walked one
+    // block at a time and the runs are jumped whole.
     let mut block = first;
     let mut uncommitted_until = first;
+    // A clean run that begins before the range and covers its first blocks.
+    if let Some(end) = clean_run_end(&g, first) {
+        block = end.min(last);
+    }
     while block < last {
-        if let Some(end) = clean_run_end(&g, block) {
+        // The blocks before the next clean run are the ones to look at.
+        let gap_end = g.runs.range(block..).next().map_or(last, |(&s, _)| s.min(last));
+        while block < gap_end {
+            let mut open = true;
+            GUARD_STATS[9].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            GUARD_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if g.absent.contains(&block) {
+                // Ordinary commits need no runtime mapping notification. Reuse
+                // this asking's query for the following blocks in the same region.
+                if block >= uncommitted_until {
+                    uncommitted_until = uncommitted_end(block);
+                }
+                open = block >= uncommitted_until;
+                if open {
+                    g.absent.remove(&block);
+                }
+            }
+            if open {
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                if g.protected.contains(&block) {
+                    // Written through the runtime, still read-only.
+                    g.clean.insert(block);
+                    mark_clean(&mut g, block, block + 1);
+                } else {
+                    run.get_or_insert(block);
+                    block += 1;
+                    continue;
+                }
+            }
             if let Some(from) = run.take() {
                 protect(&mut g, from, block);
             }
-            block = end.min(last);
-            continue;
+            block += 1;
         }
-        let mut open = true;
-        GUARD_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if g.absent.contains(&block) {
-            // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
-            }
-            open = block >= uncommitted_until;
-            if open {
-                g.absent.remove(&block);
-            }
+        if block >= last {
+            break;
         }
-        if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
-                g.clean.insert(block);
-                mark_clean(&mut g, block, block + 1);
-            } else {
-                run.get_or_insert(block);
-                block += 1;
-                continue;
-            }
-        }
+        // The clean run `block` now lies at: jumped whole.
         if let Some(from) = run.take() {
             protect(&mut g, from, block);
         }
-        block += 1;
+        let end = g.runs.range(..=block).next_back().map_or(block, |(&_, &e)| e);
+        block = end.max(block + 1).min(last);
     }
     if let Some(from) = run.take() {
         protect(&mut g, from, last);
@@ -693,7 +706,6 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     GUARD_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let t0 = std::time::Instant::now();
-    let t = std::time::Instant::now();
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
@@ -714,6 +726,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     };
     if set(from, to) {
         note(g, from, to);
+        guard_stat(8, t0.elapsed().as_nanos());
         return;
     }
     for block in from..to {
@@ -723,6 +736,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             g.absent.insert(block);
         }
     }
+    guard_stat(8, t0.elapsed().as_nanos());
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.

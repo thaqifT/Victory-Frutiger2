@@ -6106,13 +6106,13 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         {
-            let [calls, blocks, protects, covered, unknown, probe, view, body] =
-                [0, 1, 2, 3, 4, 5, 6, 7].map(|i| crate::watch::GUARD_STATS[i].swap(0, Ordering::Relaxed));
+            let [calls, blocks, protects, covered, unknown, probe, view, body, in_protect, asks] =
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(|i| crate::watch::GUARD_STATS[i].swap(0, Ordering::Relaxed));
             if calls > 0 {
                 tracing::info!(
                     "guarding per frame: {:.0} guard calls standing on {:.0} blocks, {:.0} protect calls \
                      covering {:.0} blocks; {:.0} had to ask Windows, {:.1} ms probing, {:.1} ms asking, \
-                     {:.1} ms walking ({:.2} us a call)",
+                     {:.1} ms walking of which {:.1} ms in protect, {:.0} blocks walked one by one ({:.2} us each)",
                     calls as f64 / frames,
                     blocks as f64 / frames,
                     protects as f64 / frames,
@@ -6121,6 +6121,8 @@ impl Meter {
                     probe as f64 / frames / 1e6,
                     view as f64 / frames / 1e6,
                     body as f64 / frames / 1e6,
+                    in_protect as f64 / frames / 1e6,
+                    asks as f64 / frames,
                     (probe + view + body) as f64 / calls as f64 / 1e3,
                 );
             }
