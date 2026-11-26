@@ -113,6 +113,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         over = before >= BUDGET || BUDGET - before < cost;
     }
+    if (over) {
+        // Diagnostics: records that ran empty for want of their list's
+        // budget, and the largest cost one of them asked for. A list whose
+        // budget runs out loses every record after it: a body that does not
+        // draw while its head does.
+        uint told;
+        budget.InterlockedAdd(12, 1u, told);
+        budget.InterlockedMax(16, cost, told);
+    }
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
