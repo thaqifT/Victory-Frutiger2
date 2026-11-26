@@ -6223,6 +6223,13 @@ impl Meter {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        let [drop_dispatch, drop_mesh, drop_draw, drop_indexed, drop_skipped, drop_builder, drop_none] =
+            [0, 1, 2, 3, 4, 5, 6].map(|i| {
+                crate::draw::DROPPED_WHERE[i].swap(0, Ordering::Relaxed) as f64 / frames
+            });
+        let [vertex_empty, vertex_away] = [0, 1].map(|i| {
+            crate::draw::VERTEX_SKIPPED[i].swap(0, Ordering::Relaxed) as f64 / frames
+        });
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
@@ -6396,7 +6403,12 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                 {indirect:.0} indirect (dispatch {drop_dispatch:.0}, mesh {drop_mesh:.0}, \
+                 draw {drop_draw:.0}, indexed {drop_indexed:.0}, skipped {drop_skipped:.0}, \
+                 builder {drop_builder:.0}, none {drop_none:.0}); vertex streams not bound per \
+                 frame: {vertex_empty:.0} the title left empty, {vertex_away:.0} in no window; \
+                 heap buffers {picked:.1} passes \
+                 {picked_ms:.1} ms; texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views the host would refuse made in its shape instead: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),

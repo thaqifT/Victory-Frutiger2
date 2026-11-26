@@ -419,6 +419,15 @@ static TEX_PHASE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Vertex streams a draw's input layout reads that were not bound since the
+/// last frame line: ones the title left empty, and ones in no window of
+/// title memory the host has (diagnostics).
+pub(crate) static VERTEX_SKIPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Where the drops counted since the last frame line came from: dispatch
+/// bind, mesh dispatch, draw, indexed draw, a dispatch skipped as a skipped
+/// shader, one of the structure builder's, one with no host pipeline, and
+/// one whose descriptors could not be bound (diagnostics).
+pub(crate) static DROPPED_WHERE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -878,9 +887,11 @@ impl State {
             }
             count = slot + 1;
             if v.address == 0 || v.size == 0 {
+                VERTEX_SKIPPED[0].fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                VERTEX_SKIPPED[1].fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -1010,6 +1021,10 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_why(
+                    "a draw whose descriptor table found no free slots".to_owned(),
+                );
                 return false;
             }
             // What the shader stores through root views and raw addresses is
@@ -1020,6 +1035,10 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_why(
+                        "a shader that reads title memory by address with no view heap".to_owned(),
+                    );
                     return false;
                 };
                 Some(ready)
@@ -1108,6 +1127,11 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
+                            #[cfg(feature = "diagnostics")]
+                            crate::pipeline::note_why(
+                                "a root view the title did not set, whose null table could not be made"
+                                    .to_owned(),
+                            );
                             return false;
                         }
                         continue;
@@ -1120,6 +1144,10 @@ impl State {
                         });
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
+                            #[cfg(feature = "diagnostics")]
+                            crate::pipeline::note_why(
+                                "a root view whose table could not be made".to_owned(),
+                            );
                             return false;
                         }
                         continue;
@@ -1171,6 +1199,8 @@ impl State {
                     }
                 };
                 if !self.root_uav(list, address, param, compute, writes) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_why("a root UAV could not be bound".to_owned());
                     return false;
                 }
             }
@@ -1228,6 +1258,8 @@ impl State {
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_why("a root UAV with nothing to bind".to_owned());
                 return false;
             };
             ready(a, &s);
@@ -1251,6 +1283,8 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root UAV without a bound view heap: the draw is dropped");
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a root UAV without a bound view heap".to_owned());
             return false;
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
@@ -1259,6 +1293,10 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_why(
+                        "a root UAV with no free dynamic slot in its heap".to_owned(),
+                    );
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -2213,12 +2251,14 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED_WHERE[4].fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED_WHERE[5].fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -2232,19 +2272,20 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED_WHERE[6].fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
                 self.list_dropped_roots([x, y, z]);
             }
             return;
-        };
-        if !p.compute {
+        };        if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED_WHERE[0].fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -2534,6 +2575,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED_WHERE[1].fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -2930,6 +2972,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED_WHERE[2].fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -3031,6 +3074,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED_WHERE[3].fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }

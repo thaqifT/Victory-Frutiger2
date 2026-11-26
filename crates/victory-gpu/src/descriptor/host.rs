@@ -1425,6 +1425,28 @@ impl HostHeap {
     pub(crate) fn make_at(&self, index: u32, view: &View) {
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
+            // Diagnostic: a dynamic slot the host cannot make, with what it
+            // holds. A surface that samples magenta under
+            // `VICTORY_NULL_MAGENTA=1` is one of these.
+            #[cfg(feature = "diagnostics")]
+            {
+                static FAILED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                let n = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let text = format!("{view:?}");
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.len() < 60 && !seen.contains(&text) {
+                    seen.push(text.clone());
+                    tracing::warn!(
+                        index,
+                        total = n + 1,
+                        distinct = seen.len(),
+                        view = ?text,
+                        "a dynamic slot the host cannot make is left null"
+                    );
+                }
+            }
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
@@ -2823,6 +2845,26 @@ fn magenta_texture() -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resou
 /// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
+    // Diagnostic (`VICTORY_NULL_MAGENTA=1`): see [`null_like`].
+    if null_magenta() && let Some(texture) = magenta_texture() {
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a slot of our heap, a live texture, and a desc it fits.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(&texture, Some(&desc), at);
+        }
+        return;
+    }
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,

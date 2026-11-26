@@ -78,3 +78,8 @@ Thumbs.db
 .DS_Store
 target2/
 targetdiag/
+
+# Extra build directories
+/targetdiag/
+/targetdiag2/
+/target2/
