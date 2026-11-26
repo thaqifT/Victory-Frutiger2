@@ -61,6 +61,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Whether this is the program that resolves the title's diffuse light,
+    /// which `crate::ambient` may follow.
+    #[cfg(windows)]
+    pub(crate) ambient: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -111,6 +115,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                ambient: stage == "compute" && crate::ambient::is_resolve(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })

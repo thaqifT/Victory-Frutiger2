@@ -2307,6 +2307,64 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        // The title's diffuse light is ray traced; with the builder off it
+        // finds nothing, and the stand-in lifts what it left black.
+        if crate::ambient::on()
+            && p.stages.first().is_some_and(|s| s.shader.ambient)
+            && self.ambient(list)
+        {
+            // The list's compute root signature and pipeline are ours now.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+        }
+    }
+
+    /// The stand-in for the indirect light after a dispatch of the title's
+    /// resolve program (`crate::ambient`). Whether it recorded anything.
+    fn ambient(&self, list: &HostList) -> bool {
+        use crate::ambient::{DEPTH, Image, LIGHT};
+        use crate::descriptor::View;
+        // A view of the program's tables, by root parameter and dword, with
+        // its resource's description and the host heap slot it gets.
+        let entry = |(slot, offset): (u8, u32)| {
+            let Root::Table(table) = *self.roots_ref(true).get(usize::from(slot))? else {
+                return None;
+            };
+            let heap = self.heap_of(table)?.host()?;
+            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+                View::Shader(r, _) | View::Unordered(r, ..) => r,
+                _ => return None,
+            };
+            let host = crate::resource::host_resource(resource as This)?;
+            // SAFETY: a live resource.
+            let desc = unsafe { host.GetDesc() };
+            let start = self.user_value(true, slot, RootType::Table, 0);
+            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+        };
+        let Some((of, view)) = entry(LIGHT) else {
+            once!("no stand-in for the indirect light: no view at its table's entry");
+            return false;
+        };
+        // The light is R32_UINT holding R9G9B9E5 words (beloooo's find), and
+        // it is the image of the depth the same program read.
+        let seen = entry(DEPTH).map(|(d, _)| d);
+        let right = of.Format.0 == 42
+            && of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && seen.is_some_and(|d| (d.Width, d.Height) == (of.Width, of.Height));
+        if !right {
+            once!(
+                format = of.Format.0,
+                "no stand-in for the indirect light: another image"
+            );
+            return false;
+        }
+        crate::ambient::after(
+            list,
+            &Image {
+                view,
+                size: [of.Width as u32, of.Height],
+            },
+        )
     }
 
     /// What a draw or dispatch runs, for the device-removed report
