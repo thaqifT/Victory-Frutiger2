@@ -11816,6 +11816,102 @@ mod tests {
         assert_eq!(perm_features(128) & 0x8000, 0);
     }
 
+    /// The arithmetic of [`Lower::norm_quotient`] and [`Lower::exact_norm`]
+    /// in Rust integers: the bits of the float nearest `a / d` for every code
+    /// of every width, against the quotient computed in f64 (exact to well
+    /// past the 24 bits a float keeps).
+    #[test]
+    fn normalized_codes_round_to_the_nearest_float() {
+        /// `Q = floor(a * 2^32 / d)` by the multiply and remainder shortcut.
+        fn quotient(a: u64, w: u32) -> (u64, u64) {
+            let d = (1u64 << w) - 1;
+            let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+            let mut q = a * kk;
+            let mut rem = a;
+            if r != 1 {
+                let t = a * r;
+                q += t / d;
+                rem = t % d;
+            }
+            (q, rem)
+        }
+        /// [`Lower::norm_quotient`]'s steps: `q >> 8` converts exactly, its
+        /// exponent gives the bits to drop, and the highest dropped bit is
+        /// the rounding (never a tie).
+        fn fast(a: u64, w: u32) -> u32 {
+            let (q, _) = quotient(a, w);
+            let top = (q >> 8) as f32;
+            let e = (top.to_bits() >> 23) as i64;
+            let mut shift = e - (127 + 15);
+            if q < 1 << 24 {
+                shift = 0;
+            }
+            let shift = shift as u32;
+            let up = ((q << 1) >> shift) & 1;
+            let m = (q >> shift) + up;
+            let scale = f32::from_bits((((shift as i64 + (127 - 32)) as u32) << 23) & 0xFFFF_FFFF);
+            ((m as f32) * scale).to_bits()
+        }
+        /// [`Lower::exact_norm`]'s steps: 8 more bits when that leaves fewer
+        /// than 25, then round to 24 bits to nearest even with the remainder
+        /// as sticky bit, and assemble the float bits.
+        fn exact(a: u64, w: u32) -> u32 {
+            let d = (1u64 << w) - 1;
+            let (kk, _) = ((1u64 << 32) / d, (1u64 << 32) % d);
+            let (mut q, mut rem) = quotient(a, w);
+            let mut bias: i64 = 127 + 23 - 32;
+            if kk < 1 << 24 {
+                let t = rem << 8;
+                let more = t / d;
+                let rest = t % d;
+                let wide = (q << 8) | more;
+                if q < 1 << 24 {
+                    q = wide;
+                    rem = rest;
+                    bias = 127 + 23 - 40;
+                }
+            }
+            let mut shift = 1u32;
+            for bit in 25..32 {
+                if q >= 1u64 << bit {
+                    shift += 1;
+                }
+            }
+            let mant = q >> shift;
+            let half = (q >> (shift - 1)) & 1;
+            let low = ((1u64 << (shift - 1)) - 1) & q;
+            let rest = low | rem;
+            let tie = if rest != 0 { 1 } else { mant & 1 };
+            let up = half & tie;
+            let mut mant = mant + up;
+            let carry = (mant >> 24) as i64;
+            mant >>= carry as u32;
+            let e = bias + i64::from(shift) + carry;
+            if a == 0 {
+                return 0;
+            }
+            (((e as u32) << 23) | (mant as u32 & 0x7F_FFFF)) & 0xFFFF_FFFF
+        }
+        for w in 2..=16 {
+            let d = (1u64 << w) - 1;
+            for a in 0..d {
+                let want = (a as f64 / d as f64) as f32;
+                assert_eq!(
+                    f32::from_bits(exact(a, w)).to_bits(),
+                    want.to_bits(),
+                    "exact_norm: code {a} of width {w}"
+                );
+                if !matches!(w, 11 | 12) {
+                    assert_eq!(
+                        f32::from_bits(fast(a, w)).to_bits(),
+                        want.to_bits(),
+                        "norm_quotient: code {a} of width {w}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn perm_dynamic_selector_needs_no_int64() {
         assert_eq!(
