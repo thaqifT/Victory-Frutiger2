@@ -2620,6 +2620,8 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let texture = crate::resource::texture_at(address, resource)?;
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::note_sampled(texture as crate::object::This);
     if let Some(seen) = placed_trace() {
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert(address) {
@@ -2640,21 +2642,23 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 }
 
 /// The placed textures named to be left null (`VICTORY_PLACED_NULL`).
+/// The word `all` names every one of them, for a bisect's first step.
 fn placed_nulled(address: u64) -> bool {
-    static NULLS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    NULLS
-        .get_or_init(|| {
-            std::env::var("VICTORY_PLACED_NULL")
-                .map(|v| {
-                    v.split(',')
-                        .filter_map(|s| {
-                            u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
-        .contains(&address)
+    static NULLS: std::sync::OnceLock<(bool, Vec<u64>)> = std::sync::OnceLock::new();
+    let (all, list) = NULLS.get_or_init(|| {
+        let Some(v) = std::env::var("VICTORY_PLACED_NULL").ok() else {
+            return (false, Vec::new());
+        };
+        let all = v
+            .split(',')
+            .any(|s| s.trim().eq_ignore_ascii_case("all"));
+        let list = v
+            .split(',')
+            .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        (all, list)
+    });
+    *all || list.contains(&address)
 }
 
 /// The addresses already named, when `VICTORY_PLACED_TRACE` is set.

@@ -813,6 +813,7 @@ extern "system" fn present(
         if crate::capture::dumping(frame) {
             crate::capture::dump_targets(frame);
         }
+        crate::capture::dump_sampled(frame);
     }
     #[cfg(windows)]
     if planes > 0

@@ -91,6 +91,16 @@ impl Default for GraphicsState {
     }
 }
 
+/// `VICTORY_BLEND_SRC1=1`: the second source of a dual-source blend is
+/// spelled as the first, so a pipeline with one render target reads a
+/// defined factor ([`GraphicsState::apply_blend_bypass`]).
+fn src1_plain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_BLEND_SRC1").is_some_and(|v| v == "1")
+    })
+}
+
 impl GraphicsState {
     /// The console's colour buffer bypasses its blender on surfaces that
     /// have no blender, even when the draw asks for blending: integer
@@ -145,6 +155,35 @@ impl GraphicsState {
                     | DXGI_FORMAT_G8R8_G8B8_UNORM
                     | DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM
             )
+        }
+        // The console's pixel programs write two colours for dual-source
+        // blending (`exp mrt0` then `exp mrt1`): the second is not a second
+        // surface but the blender's other source, and D3D12 reads it only
+        // when the pipeline carries a second render target. The console
+        // binds one, so `SRC1_ALPHA` reads what nothing wrote and the pass
+        // adds that to the picture. `VICTORY_BLEND_SRC1=1` spells the second
+        // source's factors as the first's, which is defined.
+        if src1_plain() {
+            fn plain(f: D3D12_BLEND) -> D3D12_BLEND {
+                D3D12_BLEND(match f.0 {
+                    14 => 3, // SRC1_COLOR -> SRC_COLOR
+                    15 => 4, // INV_SRC1_COLOR -> INV_SRC_COLOR
+                    16 => 5, // SRC1_ALPHA -> SRC_ALPHA
+                    17 => 6, // INV_SRC1_ALPHA -> INV_SRC_ALPHA
+                    other => other,
+                })
+            }
+            let n = if self.blend.IndependentBlendEnable.as_bool() {
+                8
+            } else {
+                1
+            };
+            for t in &mut self.blend.RenderTarget[..n] {
+                t.SrcBlend = plain(t.SrcBlend);
+                t.DestBlend = plain(t.DestBlend);
+                t.SrcBlendAlpha = plain(t.SrcBlendAlpha);
+                t.DestBlendAlpha = plain(t.DestBlendAlpha);
+            }
         }
         let formats = &self.targets.RTFormats[..(self.targets.NumRenderTargets as usize).min(8)];
         if !self.blend.IndependentBlendEnable.as_bool() {

@@ -511,7 +511,7 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        dump_one("frame", host, texture, state, frame, i, *resource as crate::object::This, &d);
     }
     // One frame of every target is hundreds of files: left alone across a
     // run that dumps every 16th frame the folder is tens of thousands. The
@@ -528,7 +528,60 @@ pub(crate) fn dump_targets(frame: u64) {
     prune_keeping(folder, written);
 }
 
+/// With `VICTORY_DUMP_SAMPLED` set: the placed textures shader views name
+/// during a dumped frame, saved at that frame's present as
+/// `sampled-<frame>-<i>-<resource>-<w>x<h>-f<format>.png`. [`dump_targets`]
+/// shows what each pass wrote; these are what a pass read, which is the
+/// other half of a wrong picture.
+static SAMPLED: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn sampled_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_SAMPLED").is_some())
+}
+
+/// Notes a placed texture a shader view names during the frame being built.
+/// Only frames named in `VICTORY_CAPTURE_FRAMES` (or the world-frame
+/// offsets) are kept: a frame samples hundreds, and the folder would hold
+/// them all.
+pub(crate) fn note_sampled(resource: crate::object::This) {
+    if resource.is_null() || !sampled_on() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    let mut sampled = SAMPLED.lock().unwrap_or_else(|e| e.into_inner());
+    // A frame samples thousands: the cap keeps a dumped frame to one folder's
+    // worth of files, and the order is first use.
+    if sampled.len() >= 512 || sampled.iter().any(|&(r, _)| r == resource as usize) {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    sampled.push((resource as usize, copy));
+}
+
+/// At the present of frame `frame`: saves the noted sampled textures.
+pub(crate) fn dump_sampled(frame: u64) {
+    if !sampled_on() {
+        return;
+    }
+    let sampled = std::mem::take(&mut *SAMPLED.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(host) = crate::host::host() else { return };
+    for (i, (resource, copy)) in sampled.iter().enumerate() {
+        let texture = &copy.texture;
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            continue;
+        }
+        let state = copy.state.load(std::sync::atomic::Ordering::Relaxed);
+        dump_one("sampled", host, texture, state, frame, i, *resource as crate::object::This, &d);
+    }
+}
+
 fn dump_one(
+    kind: &str,
     host: &crate::host::Host,
     texture: &ID3D12Resource,
     state: u32,
@@ -610,7 +663,7 @@ fn dump_one(
         }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+                "{kind}-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);

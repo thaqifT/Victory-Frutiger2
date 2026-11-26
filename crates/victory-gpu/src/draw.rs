@@ -3027,6 +3027,11 @@ impl State {
         if list.is_empty() {
             return false;
         }
+        // Said once so a run's log carries whether the list arrived at all.
+        static SAID_LIST: std::sync::Once = std::sync::Once::new();
+        SAID_LIST.call_once(|| {
+            tracing::info!(list = ?list, "draws: VICTORY_SKIP_SHADERS list");
+        });
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -3164,7 +3169,7 @@ impl State {
         if lost {
             once!("indexed rectangles not drawn");
         }
-        let ran = !lost && self.prepare(list, true);
+        let ran = !lost && self.prepare(list, true) && !self.skipped();
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -3358,9 +3363,9 @@ impl State {
             }
         };
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED) && !self.skipped(),
+            MESH => self.prepare_for(list, false, true) && !self.skipped(),
+            DISPATCH => self.bind(list, p, true) && !self.skipped(),
             _ => false,
         };
         if !ran {
