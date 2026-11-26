@@ -1,8 +1,9 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25: **nothing is lit by ray tracing yet.** Most of the
-machinery translates and is unit-tested; it has not yet run end to end in the
-game. Everything here is off by default.
+Status, 2026-11-26: **nothing is lit by ray tracing yet.** All 53 builder
+programs the title creates now have host pipelines and the builder runs end to
+end, but a run with it on dies inside the title at world entry. Everything here
+is off by default.
 
 ## What the title does
 
@@ -35,11 +36,13 @@ shaders and emulates the one instruction.
 
 ## What this fork adds
 
-1. **The builder programs translate** (49 of 52; all that the title creates in
-   the scenes tested). They pass buffer addresses in a spilled parameter table
-   rather than in descriptors. Added: the spilled user-data table, root
-   unordered-access views (translator and host binding), byte and 16-bit buffer
-   accesses, and several control-flow shapes.
+1. **The builder programs translate** (53 of 53 that the title creates in the
+   scenes tested; run 2026-11-26 prints `the ray-tracing structure builder
+   runs: all of its programs have host pipelines pipelines=53`). They pass
+   buffer addresses in a spilled parameter table rather than in descriptors.
+   Added: the spilled user-data table, root unordered-access views (translator
+   and host binding), byte and 16-bit buffer accesses, and several control-flow
+   shapes.
 2. **Title memory by raw address from shaders.** A directory with one entry per
    64 KiB of title address space leads a shader to the layer's host copy of
    that memory; loads, stores, atomic add/sub and float min/max go through it.
@@ -63,9 +66,23 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
+- **The builder runs but the title dies.** With `VICTORY_BVH_BUILDER=1` all 53
+  stages run and the title hits `unhandled exception 0xc0000005` at world
+  entry, reading `0xffffffffffffffff`. Four experiments rule out the obvious
+  causes:
+  - `VICTORY_RELAY=0` (copy back synchronously instead of relaying through the
+    card's own dirty ranges): still dies.
+  - `VICTORY_WRITE_SKIP=0` (declare every bound view written instead of only
+    the unordered-access ones): still dies.
+  - `VICTORY_BVH_QUARANTINE=1` (keep every builder store out of title memory):
+    survives, but the world is destroyed — the title reads structure sizes and
+    counters back and finds whatever was there before, so the meshes explode
+    into staircase patterns (`cap/shot-0036.png`).
+  - No `title memory by address: shaders touched pages that had no copy` line
+    fires in any run, so the pages the builder writes were ready.
+  So at least one stage stores to a wrong address (or a wrong value), or a
+  store that should reach title memory is not copied back over the range the
+  title reads. Not yet localised.
 - Five shadow-mask trace programs do not translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).

@@ -2266,6 +2266,15 @@ impl State {
             }
             return;
         }
+        // A bisect of the builder (`VICTORY_BVH_STAGES`): only its first
+        // stages run.
+        if crate::pipeline::is_builder(self.pipeline as This)
+            && !crate::pipeline::builder_stage_runs(self.pipeline as This)
+        {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED_WHERE[5].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),

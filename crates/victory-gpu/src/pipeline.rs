@@ -281,10 +281,47 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
+/// `VICTORY_BVH_STAGES=<n>`: run only the first `n` distinct builder
+/// pipelines the title dispatches, in the order it first dispatches them,
+/// and drop the rest. A bisect for the stage whose stores corrupt title
+/// memory: the smallest `n` at which a run dies names the stage. Every
+/// stage's number and shader hash is logged once, so the number means
+/// something. Without the variable every stage runs.
+#[cfg(windows)]
+pub(crate) fn builder_stage_runs(this: This) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static LIMIT: OnceLock<Option<usize>> = OnceLock::new();
+    static ORDER: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    let Some(limit) = *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_BVH_STAGES").ok()?.parse().ok()
+    }) else {
+        return true;
+    };
+    let key = this as usize;
+    let mut order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    let ordinal = match order.iter().position(|p| *p == key) {
+        Some(i) => i,
+        None => {
+            order.push(key);
+            let i = order.len() - 1;
+            let hash = pipeline(this)
+                .shaders
+                .first()
+                .map_or_else(String::new, |s| s.hash.to_string());
+            tracing::info!(
+                stage = i,
+                hash = %hash,
+                "the structure builder's stages, in the order the title first dispatches them"
+            );
+            i
+        }
+    };
+    ordinal < limit
+}
+
 /// A stage of the builder was dropped after all: none runs from here on.
 #[cfg(windows)]
-pub(crate) fn builder_off(why: &'static str) {
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+pub(crate) fn builder_off(why: &'static str) {    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
