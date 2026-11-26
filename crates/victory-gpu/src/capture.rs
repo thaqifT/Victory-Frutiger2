@@ -219,6 +219,9 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
     } else {
         save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
     }
+    if let Some(folder) = folder() {
+        prune(folder);
+    }
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
@@ -254,6 +257,45 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     match std::fs::write(&path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+/// Keeps the capture folder bounded while a run is going. Every 16th present
+/// the folder is listed and the oldest pictures are removed until
+/// `VICTORY_CAPTURE_KEEP` (default 160) are left. A menu boot at 30 fps makes
+/// six pictures a second and those stop being worth looking at the moment the
+/// world starts, so the window is a rolling one rather than a per-run count.
+/// Only the present path prunes: a target dump writes every target of one
+/// frame at once and must not delete the earlier ones of its own frame.
+fn prune(folder: &std::path::Path) {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    static SINCE: AtomicU32 = AtomicU32::new(0);
+    if !SINCE.fetch_add(1, Relaxed).is_multiple_of(16) {
+        return;
+    }
+    let keep: usize = std::env::var("VICTORY_CAPTURE_KEEP")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(160);
+    if keep == 0 {
+        return;
+    }
+    let Ok(dir) = std::fs::read_dir(folder) else { return };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = dir
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+        .filter_map(|e| {
+            let t = e.metadata().ok()?.modified().ok()?;
+            Some((t, e.path()))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort();
+    let drop = files.len() - keep;
+    for (_, p) in files.into_iter().take(drop) {
+        let _ = std::fs::remove_file(p);
     }
 }
 
