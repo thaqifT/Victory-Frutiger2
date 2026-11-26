@@ -1927,6 +1927,11 @@ fn host_texture(
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
+        // Its memory is mapped into the card's address space before a slot
+        // can name it (see `crate::host::mapped`).
+        if let Err(e) = crate::host::mapped(&host.device) {
+            tracing::warn!(error = %e, "a host texture's memory was not waited for");
+        }
     }
     texture
 }
