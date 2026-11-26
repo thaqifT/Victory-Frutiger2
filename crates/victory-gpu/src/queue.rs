@@ -845,6 +845,7 @@ extern "system" fn present(
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
         let shown = host.present(texture, state, frame);
+        crate::rdoc::maybe_capture(frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
