@@ -1,4 +1,4 @@
-//! IR to DXIL, one machine instruction at a time (decision 0003).
+﻿//! IR to DXIL, one machine instruction at a time (decision 0003).
 //!
 //! Every register dword is an `i32` (SCC an `i1`); float operations bitcast
 //! their operands. Lane masks exist only as the per-lane booleans of
@@ -281,6 +281,11 @@ struct Lower<'a> {
     balloting: HashSet<Value>,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
+    /// A value copied from another by a plain scalar move: the value it was
+    /// copied from. A mask is often moved on before it is read as data, and
+    /// the lanes it holds are the lanes of the block where it was made, not
+    /// of the block that copied it.
+    copies: HashMap<Value, Value>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -342,7 +347,7 @@ pub(crate) fn tracing_masks() -> bool {
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
+/// Per IR block: every lane of the wave that started the program runs it â€“ no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
@@ -939,7 +944,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
     false
 }
 
-/// The widest wave the host GPU runs (0: not known – no host-specific forms); see
+/// The widest wave the host GPU runs (0: not known â€“ no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -1280,8 +1285,8 @@ impl<'a> Lower<'a> {
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
-            // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
+            // wave64 program whose cross-lane code stays inside 32-lane halves â€“ DPP rows,
+            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there â€“ runs
             // exactly in waves of 32: the thread relabelling makes each host wave one half of a
             // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
@@ -1304,7 +1309,7 @@ impl<'a> Lower<'a> {
                     // waves, which exchange through their own pair of dwords.)
                     // LDS the console shares within its one wave without barriers: split into
                     // two waves of 32, a group barrier before every LDS access keeps their order
-                    // – where every thread of the group gets there (no lane branch around it,
+                    // â€“ where every thread of the group gets there (no lane branch around it,
                     // no guard), else a barrier would hang the group
                     let lds = |i: &Inst| {
                         matches!(i.fields, Fields::Ds { .. })
@@ -1567,6 +1572,17 @@ impl<'a> Lower<'a> {
                         .flat_map(move |i| i.writes.iter().map(move |w| (w.1, b)))
                         .chain(block.phis.iter().map(move |phi| (phi.value, b)))
                 })
+                .collect(),
+            copies: p
+                .blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .filter(|i| i.name().starts_with("s_mov_"))
+                .flat_map(|i| {
+                    let from = i.reads.first().map(|r| r.1);
+                    i.writes.iter().map(move |w| (w.1, from))
+                })
+                .filter_map(|(v, from)| from.map(|f| (v, f)))
                 .collect(),
             cur_ir: 0,
             sections: HashMap::new(),
@@ -3148,6 +3164,25 @@ impl<'a> Lower<'a> {
         seen.get(b).copied().unwrap_or(false)
     }
 
+    /// The value a mask was made as, following plain scalar moves back to
+    /// the value it was copied from: the lanes a mask holds are the lanes of
+    /// that value, not of a move that only passed it along.
+    fn mask_origin(&self, lo: Value) -> Value {
+        let mut at = lo;
+        for _ in 0..8 {
+            match self.copies.get(&at) {
+                Some(&from) if from != at => at = from,
+                _ => break,
+            }
+        }
+        at
+    }
+
+    /// The block where a mask value was made.
+    fn mask_made(&self, lo: Value) -> Option<usize> {
+        self.def_block.get(&self.mask_origin(lo)).copied()
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -3159,8 +3194,16 @@ impl<'a> Lower<'a> {
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
-        let made = self.def_block.get(&lo).copied();
-        let whole = !self.local && made.is_none_or(|b| self.all_lanes(b) && self.every_lane(b));
+        let made = self.mask_made(lo);
+        let origin = self.mask_origin(lo);
+        // A mask a block's phi carries holds, in each lane that reaches the
+        // block, the bit its own path left: a ballot in that block gives it,
+        // where every lane of the wave runs there.
+        let joined = made.is_some_and(|b| self.x.p.blocks[b].phis.iter().any(|p| p.value == origin));
+        let whole = !self.local
+            && ((joined && made.is_some_and(|b| self.all_lanes(b)))
+                || made.is_none_or(|b| self.all_lanes(b) && self.every_lane(b))
+                || self.x.st.from_exec.contains(&origin));
         if !self.x.st.active.contains(&lo) && !whole {
             if tracing_masks() {
                 let insns = made.map(|b| {
@@ -3186,12 +3229,19 @@ impl<'a> Lower<'a> {
                         .join(" ")
                 });
                 eprintln!(
-                    "maskfail {lo:?} block={made:?} all_lanes={:?} every_lane={:?} exchange={} local={} reach_true={:?}\n  insns=[{}]\n  preds=[{}]",
+                    "maskfail {lo:?} block={made:?} all_lanes={:?} every_lane={:?} exchange={} local={} reach_true={:?} from_exec={} def={:?}\n  insns=[{}]\n  preds=[{}]",
                     made.map(|b| self.all_lanes(b)),
                     made.map(|b| self.every_lane(b)),
                     self.exchange.is_some(),
                     self.local,
                     made.map(|b| self.x.st.reach[b] == Bool::TRUE),
+                    self.x.st.from_exec.contains(&lo),
+                    made.map(|b| self.x.p.blocks[b]
+                        .insts
+                        .iter()
+                        .filter(|i| i.writes.iter().any(|w| w.1 == lo))
+                        .map(|i| (i.machine.offset, i.name(), i.machine.words.clone()))
+                        .collect::<Vec<_>>()),
                     insns.unwrap_or_default(),
                     preds.unwrap_or_default(),
                 );
@@ -3204,11 +3254,11 @@ impl<'a> Lower<'a> {
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
-                let at = match self.def_block.get(&lo) {
+                let at = match self.mask_made(lo) {
                     // Program inputs (EXEC on entry).
                     None => self.s.entry,
-                    Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                    Some(b) if b == self.cur_ir => self.cur,
+                    Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
@@ -3578,7 +3628,7 @@ impl<'a> Lower<'a> {
     /// +0 on the hardware, where the host's function of the rounded angle
     /// gives about 1e-7. Infinities and NaN give NaN.
     /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2π (a last-place difference).
+    /// different constant than 2Ï€ (a last-place difference).
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -3596,7 +3646,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 × 32-bit product.
+    /// The high dword of a 32 Ã— 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
         let i64t = self.s.m.int(64);
@@ -3610,7 +3660,7 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 Ã— anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
@@ -4556,7 +4606,7 @@ impl<'a> Lower<'a> {
             _ => 1,
         };
         // (byte offset, dwords) per element; read2/write2 scale their two
-        // offsets by the element size (×64 for st64).
+        // offsets by the element size (Ã—64 for st64).
         let pair = |n: &str| -> Vec<(u32, u32)> {
             let w = width(n);
             let scale = 4 * w * if n.contains("st64") { 64 } else { 1 };
@@ -4753,7 +4803,7 @@ impl<'a> Lower<'a> {
     /// otherwise a NaN loses to a number (two quiet NaNs give the data);
     /// numbers compare as floats with -0 below +0.
     // shortcut: f32 denormals compare as kept; with the console's MODE
-    // flushing them they would order as ±0 first (MODE is not modelled).
+    // flushing them they would order as Â±0 first (MODE is not modelled).
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
         let pre = self.cur;
         let init = self.s.m.load(pre, p);
@@ -8061,7 +8111,7 @@ impl<'a> Lower<'a> {
         let tie = self.s.m.bin(c, Bin::And, at, odd);
         let up = self.s.m.bin(c, Bin::Or, above, tie);
         let up = self.s.m.select(c, up, one, zero);
-        // Rebias the exponent (1023 → 127); a carry out of the mantissa
+        // Rebias the exponent (1023 â†’ 127); a carry out of the mantissa
         // steps the exponent, up to infinity.
         let bias = k(self, 1023 - 127);
         let e32 = self.s.m.bin(c, Bin::Sub, e, bias);
@@ -10314,7 +10364,7 @@ impl<'a> Lower<'a> {
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
     // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
+    // operand adds 8 Ã— the slice).
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());

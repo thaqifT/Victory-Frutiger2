@@ -431,6 +431,12 @@ pub struct Structured {
     /// ballot there gives the mask as data. No split low dword, as in
     /// `masks`.
     pub active: HashSet<Value>,
+    /// Masks (low dwords) written by copying EXEC itself. EXEC at that
+    /// instruction holds exactly the lanes running there, so a ballot in the
+    /// writing block gives the mask as data whether or not every lane of the
+    /// wave reaches it: a lane in another region is not in EXEC, and its bit
+    /// is clear in the copy too.
+    pub from_exec: HashSet<Value>,
     /// Incoming lane boolean per predecessor edge (in block predecessor order)
     /// for each [`Atom::Phi`] id.
     pub phi_masks: HashMap<Value, Vec<Bool>>,
@@ -530,6 +536,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::from_exec`].
+    from_exec: HashSet<Value>,
     /// See [`Structured::wide`].
     wide: HashSet<usize>,
     /// SCC values of [`Self::scc_lane`] that are set when EVERY lane's bit is (`s_cmp_eq` of
@@ -614,6 +622,7 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            from_exec: HashSet::new(),
             wide: HashSet::new(),
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
@@ -838,6 +847,7 @@ impl<'a> Lanes<'a> {
         }
         self.masks.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
+        self.from_exec.retain(|lo| !split.contains(lo));
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -848,6 +858,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            from_exec: self.from_exec,
             wide: self.wide,
             wave_any: self.wave_any,
             scc_some: self
@@ -1206,6 +1217,15 @@ impl<'a> Lanes<'a> {
                             || exec.is_some_and(|e| self.b.implies(m, e))
                         {
                             self.active.insert(k.0);
+                        }
+                        // A copy of EXEC: the lanes in the copy are the lanes
+                        // running there, so a ballot in this block gives it.
+                        if name.starts_with("s_mov_")
+                            && let Fields::Sop { src, .. } = &inst.fields
+                            && let Some(Operand::Scalar { code, .. }) = src.first()
+                            && *code == EXEC
+                        {
+                            self.from_exec.insert(k.0);
                         }
                         if crate::emit::lower::tracing_masks() {
                             eprintln!(
