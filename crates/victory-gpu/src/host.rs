@@ -3972,6 +3972,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+pub(crate) mod heap_pace;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 mod panel;
@@ -5855,6 +5856,11 @@ impl Host {
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        // Prepared only behind the card's end of the frame sent before
+        // (`VICTORY_HEAP_SYNC_PACE=1`, Vice-Tay #357).
+        if late {
+            heap_pace::before_submission();
+        }
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
@@ -9581,6 +9587,7 @@ impl Meter {
             crate::shadow::exact_line(frames);
             crate::descriptor::sync_line(frames);
             late_line(frames);
+            heap_pace::line(frames);
             // The renderer ports' counters, printed whether or not `late` is
             // on: each of these returns at once unless its switch is on (or,
             // under `VICTORY_AB`, the current phase has it). They used to sit
@@ -10159,6 +10166,8 @@ impl Host {
                     0
                 }
             };
+            // The frame's end on the card (`VICTORY_HEAP_SYNC_PACE=1`).
+            heap_pace::sent(flown);
             #[cfg(feature = "diagnostics")]
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);

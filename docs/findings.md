@@ -964,3 +964,49 @@ something without a frame of video.
 
 The frame lines carry `write-combining skip off`. 98 warnings and errors over
 the run, all of them the usual texture-index and unmirrored-view notes.
+
+### The relay is closed: both stages wedge
+
+`rel3` was the cheap third data point the last session left open —
+`VICTORY_RELAY=2;VICTORY_D3D12_DRED=full`, 180 s asked for. It died at 65 s:
+
+```
+ERROR victory_gpu::host: device-removed data; breadcrumbs (done/count, list) []
+ERROR victory_gpu::host: no host list for a state prelude; device removed:
+      ... (0x887A0007)
+```
+
+Same shape as `rel2` (`=1`): breadcrumbs **empty**, then `0x887A0007`. DRED
+only reports lists that were submitted, so an empty list means nothing of ours
+was in flight when the card went. That is a wedge, not a bad command, and it is
+the same wedge in both stages.
+
+So the relay is not "blocked on a bad command" any more — it is **closed**.
+Stage 1 waits for everything in the air, stage 2 waits exactly, and both hang
+the card. The 40 ms of overlap it promised (144 → ~104 ms) is not reachable by
+turning it on.
+
+What would be left to try, if a later session wants it: `VICTORY_LATE_WAIT=3`
+alone, without the relay, to see whether the late path itself wedges the card
+or only the landing thread does. Nothing else in the relay's stack is
+unmeasured.
+
+### Heap pacing, ported and off (`Vice-Tay` #357)
+
+The title's descriptors are rewritten for frame F+1 as soon as its present of F
+returns, and our side brings them into the host heaps while the card may still
+be drawing F — so F's draws can read F+1's views. That is the stretched
+triangle ("wedge") artifact of `Vice-Tay` #90.
+
+`host/heap_pace.rs` is the port: a submission of ours is prepared only when the
+card has run the newest frame we sent (`sent()` takes the fence behind the
+present's copy), with a 250 ms give-up so a frame that never ends cannot stop
+us, and `descriptor::sync_early()` returns `None` so the heaps' rounds of their
+own stop.
+
+**It is off by default here** (`VICTORY_HEAP_SYNC_PACE=1` turns it on), which
+is the opposite of upstream. Their own numbers are 17–19 fps down to 12–14 on
+an RTX 2080 Ti, and this port's whole business is that the card and our
+preparing already run at the same time — which is exactly the overlap this
+build is short of. It is worth having as a switch for a frame that shows a
+wedge, not as a default.

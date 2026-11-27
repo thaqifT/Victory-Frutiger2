@@ -195,6 +195,10 @@ fn sync_early() -> Option<std::time::Duration> {
     static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
     *EVERY.get_or_init(|| {
         let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64);
+        // With the heaps paced (`VICTORY_HEAP_SYNC_PACE=1`) no round of its
+        // own: a round may only follow the card's end of the frame before
+        // (Vice-Tay #357).
+        let ms = if crate::host::heap_pace::on() { 0 } else { ms };
         (ms > 0).then(|| std::time::Duration::from_millis(ms))
     })
 }
