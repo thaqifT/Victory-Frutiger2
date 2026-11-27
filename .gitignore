@@ -76,3 +76,9 @@
 *.swp
 Thumbs.db
 .DS_Store
+# Run captures the wrapper leaves in the crate root
+/[a-z][a-z][a-z][0-9]
+/[a-z][a-z][a-z][0-9].txt
+/[a-z][a-z][0-9]
+/[a-z][a-z][0-9].txt
+
