@@ -16,14 +16,20 @@ answers are different.
 | RAM | 31.9 GiB |
 | Display | 1920x1080 |
 | Driver | `32.0.21045.29003` |
-| Boot to world | ~140 s |
-| Stability | **300 s in world, zero device removals** |
-| Frame rate in world | 3–5 fps, 1200–4100 draws/frame |
+| Boot to world | ~67 s |
+| Stability | **240 s in world, zero device removals, every run** |
+| Frame rate in world | 4–10 fps, 900–6500 draws/frame |
+| Mean frame, release build | **198 ms** (100–200 s window) |
 | Peak working set | ~21 GB |
 
 The picture is correct — beach, water, character, lighting, colour. It renders
 the scene the title built. Frame rate is the open problem, and it is a
 throughput problem, not a correctness one.
+
+**`--profile release` is the play build.** It is 15–26 % faster than the
+diagnostics build on the same script and the same scene class, on *more* draws
+in both windows measured. Diagnostics stays for cause breakdowns; release is
+what runs when the question is "is it faster".
 
 ## The finding
 
@@ -65,23 +71,71 @@ killer.
 
 ## The frame budget
 
-A world frame at 3291 draws, 421 ms:
+The honest breakdown, from `VICTORY_TIMELINE` on a diag run (204.6 ms/frame):
 
 | | |
 |---|---|
-| On the GPU | 104 ms |
-| Preparing | 59 ms — 30 ms of it recording 116 MB of copies |
-| Copying back | 37.5 ms — 30.6 MB pulled from card memory |
-| CPU-side recording | ~220 ms |
+| The card running submissions | 49 ms |
+| Preparing (the title's own `XMemMapPhysicalPages`) | 18 ms |
+| Copying back into title memory | 7 ms |
+| Work spread over threads | 6 ms |
+| Jobs for another thread | 7 ms |
+| A copy's refresh, a texture's refresh | 8 ms |
+| Resetting a host list, the lists' steps | 7 ms |
+| Outside our spans | 4 ms |
 
-And the number that explains the crawl:
+**The frame is serialized, not overlapped**: ~45 ms of GPU wait and ~79 ms of
+CPU work, and they do not run at the same time. `max(GPU, CPU)` is what
+overlapping them would buy, and it is worth up to 78 ms. It is also
+unreachable on this title — both the relay and the late path remove the device,
+there is no D3D12 debug layer on this machine (`0x887A002D`), and there is no
+GPU capture tool that sees through the translation.
 
+## What is measured and closed
+
+Every lever below was run, measured against a baseline over a 100-second
+window, and closed on evidence. They are written down so nobody re-tests them.
+
+| lever | verdict |
+|---|---|
+| `VICTORY_RENDER_SCALE` below 2/3 | no effect — the title's largest render size clamps at 2/3 |
+| `VICTORY_FSR_4K` | **4K-only.** This panel is 1920x1080: a 4K output renders 4x the pixels and downsamples back |
+| `VICTORY_UPSCALER` | cosmetic — patches the picker, does not select the FSR path |
+| `VICTORY_PORT_DESCRIPTORS` (port 2) | 1.17 ms/frame cost, no saving; the scan it replaces does not exist here |
+| `VICTORY_PORT_GUARD` (port 6) | measured, off |
+| `VICTORY_PORT_JOURNAL` (port 7) | measured, off |
+| `kernel: GetWriteWatch` write-watch | 2.37 ms/frame, 1.1 % — not the cost |
+| `VICTORY_SYNC_FINE` | inside the noise: +3.0 % one window, −5.7 % the next |
+| card-buffer pair `MIN_KB=64` / `MB=1536` | loses badly, 217.7 ms against 123.7; mapping causes explode |
+| `VICTORY_LATE_*` | removes the device within 40–110 s with every knob off |
+
+Two fixes that **did** land and are proven:
+
+- **Page-mapping** (`271c815a`, `07ff49ee`): `CopyPageMappings` 64.07 → 1.17 ms,
+  `XMemMapPhysicalPages` 50.24 → 3.88 ms. Aliased views are mapped one view per
+  run of slices. The cost is call count, not call size — `UnmapViewOfFile2` is
+  0.223 ms and `MapViewOfFile3` 0.116–0.128 ms, both dominated by the
+  address-space lock.
+- **Release build** over diagnostics: 15–26 %.
+
+## Measuring honestly
+
+Run-to-run variance is larger than most levers. The same scene class, the same
+script, four runs: 123.7, 142.0, 144.8, 217.7 ms. Comparing two separate runs
+is how you fool yourself.
+
+```powershell
+.\fpswin.ps1 -Tag rl1 -Tag2 pm2 -From 100 -To 200
 ```
-textures picked by index: 64324 uploaded (5634 MB), 7907 waiting
-```
 
-Seven thousand nine hundred textures queued and never caught up. Every frame is
-still uploading. That is the frame-rate problem, and it is next.
+reads `looks\<tag>\fps.txt` (the wrapper's per-second curve) and reports the
+mean, median and p90 of the ms/frame over a window, so two runs compare over
+100 seconds instead of one 30-frame sample.
+
+On a diagnostics build there is also `VICTORY_AB=<seconds>,<switch>,<switch>`:
+it sweeps every combination of the named switches inside one run, in one
+scene, and logs each phase's mean, median and p90. Two switches at 30 s is
+120 s of measurement with no scene change at all.
 
 ## Running it
 
@@ -118,14 +172,34 @@ take it.
 
 ## Building
 
+Two profiles. **Release is the play build** (15–26 % faster); diagnostics is
+for cause breakdowns and `VICTORY_AB`.
+
 ```powershell
 cd E:\GTA6_Frutiger\victory2
 $env:CARGO_TARGET_DIR='E:\GTA6_Frutiger\victory2\target'
+
+# play build
+cargo build --locked --profile release -p victory
+
+# diagnosis build
 cargo build --locked --profile diag -p victory --features diagnostics
 ```
 
-Cold build ≈ 1m27s. Toolchain pinned at `rustc/cargo 1.98.1`. `cargo` prints
+≈2m cold, either one. Toolchain pinned at `rustc/cargo 1.98.1`. `cargo` prints
 `Exited with code 1` on stderr even when it succeeds — check for `Finished`.
+
+`run2.ps1 -Profile release` runs the first, `-Profile diag` (the default) the
+second.
+
+## Reading a run
+
+| file | holds |
+|---|---|
+| `looks\<tag>\fps.txt` | the per-second curve — `X fps Y ms/frame Z draws/frame` |
+| `log-<tag>.txt` | the boot banner and the wrapper's own lines |
+| `log-<tag>.err.txt` | **everything the runtime says** — tracing goes here, not to `.txt` |
+| `looks\<tag>\*.png` | the screenshots `-Shots` took |
 
 ## What this branch is
 
