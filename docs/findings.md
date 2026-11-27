@@ -628,3 +628,30 @@ line reports pieces and megabytes left behind per frame.
 
 The measured cost it is aimed at, from `gd14`: 13.6 ms to put 8.5 MB back,
 645 MB/s, against the 640 MB/s an uncached line costs at 64 B per ~100 ns.
+### Upstream triage: what was looked at and why it was not taken
+
+Three of `fxceless/victory-fork`'s 946 open PRs were read against this tree.
+
+- **#1450, "cap the time a frame waits for compute pipelines made at their
+  dispatch."** A real crash fix -- with `VICTORY_PIPELINE_COMPUTE_WAIT` on, an
+  empty cache built 457 compute programs in one frame at about a second each,
+  the frame did not end for 30 s, and the title's own hang watchdog stored to
+  address 0. **Not applicable here:** this tree has no
+  `VICTORY_PIPELINE_COMPUTE_WAIT` and no compute-at-dispatch path at all --
+  `ready()` always goes through `wait(p, frame)` under the frame's budget
+  (`pipeline/make.rs:416`). The crash shape does not exist. What this tree does
+  have is the bounded version of the same wait, which `gd15` measured at 250.3
+  ms in one window.
+- **#1192, "reduce CPU work when preparing descriptor tables."** 217 lines
+  across two files, a restructure of the static table layout, the slot set and
+  the dynamic view expressions. Its own body says "**no gameplay FPS gain has
+  been measured**". High regression risk on the path every draw goes through,
+  no number on the other side. Not taken.
+- **#1479, "count the pieces that differ on the relay and card merges."**
+  Diagnostics only, and this tree already counts them: the frame account prints
+  `what shaders wrote: 2.8 ms finding 438 pieces that differ, 13.6 ms putting
+  them back`, and `card_back` counts `CARD_STATS[3..6]` for pieces, bytes,
+  fetches and the wait. Not taken.
+
+#868 is the one that carried a measurement, and it is now in the tree as
+`crate::wc`.
