@@ -744,6 +744,107 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     })
 }
 
+/// 64 KiB pages the kernel will not ask about, found once and never asked
+/// about again.
+///
+/// `GetWriteWatch` refuses a range whole if any page of it is not
+/// write-watchable mapped memory, and a range that is refused falls to
+/// `writes`, which cannot ask for less: it guards the range or copies all of
+/// it. In a heavy scene that is the whole 174 MB heap walked to find nothing
+/// (gd1: 18.3 ms a frame over 8,288 MB, 8,220 MB unchanged). One page of the
+/// heap that is not write-watched therefore costs the heap, every flush.
+///
+/// So a refusal is taken apart by halves until the page that refuses is
+/// alone, and it is noted here: the pages beside it are asked as before, and
+/// the one page that cannot be asked costs its own 64 KiB. The first asking
+/// that meets it pays the walk down; every one after it does not.
+static UNWATCHABLE: Bits = Bits::new();
+
+/// `VICTORY_ASK_BISECT`: a refused asking taken apart by halves ([`UNWATCHABLE`]).
+fn ask_bisect() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let default_on = || *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_BISECT").is_none_or(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_ASK_BISECT").unwrap_or_else(default_on);
+    #[cfg(not(feature = "diagnostics"))]
+    let on = default_on();
+    on
+}
+
+/// How many kernel calls one range's bisection may spend. A range that
+/// refuses is taken apart until the refusing page is alone; on a heap that is
+/// mostly view memory that is one call per level per page, and the first
+/// asking would pay for all of them at once. Past this the range is left to
+/// `writes` as before, and the pages found on the way stay noted for the
+/// askings after it.
+const BISECT_CALLS: u32 = 24;
+
+/// [`kernel_written`] for `[first, last)` pages, asked in the parts the
+/// kernel will take: the pages found written are returned and the sub-ranges
+/// actually asked are added to `asked`, so that `writes` can answer from the
+/// journal for those and only those.
+///
+/// Without [`ask_bisect`] this is one asking, and a refusal leaves `asked`
+/// empty, as before.
+fn ask_split(first: usize, last: usize, asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
+    let mut budget = BISECT_CALLS;
+    ask_split_within(first, last, asked, written, &mut budget);
+}
+
+fn ask_split_within(
+    first: usize,
+    last: usize,
+    asked: &mut Vec<(usize, usize)>,
+    written: &mut Vec<(usize, u16)>,
+    budget: &mut u32,
+) {
+    if first >= last {
+        return;
+    }
+    if !ask_bisect() {
+        if let Some(pages) = kernel_written(first, last) {
+            written.extend(pages);
+            asked.push((first, last));
+        }
+        return;
+    }
+    // The pages already known to refuse, inside this range: ask the parts
+    // between them and leave those to `writes`.
+    let refused: Vec<usize> = UNWATCHABLE.set_in(first, last).collect();
+    if !refused.is_empty() {
+        let mut from = first;
+        for block in refused {
+            if from < block {
+                ask_split_within(from, block, asked, written, budget);
+            }
+            from = block + 1;
+        }
+        if from < last {
+            ask_split_within(from, last, asked, written, budget);
+        }
+        return;
+    }
+    if *budget == 0 {
+        // Out of calls: this part is left to `writes`, which guards it or
+        // copies it, exactly as a refusal did before.
+        return;
+    }
+    *budget -= 1;
+    if let Some(pages) = kernel_written(first, last) {
+        written.extend(pages);
+        asked.push((first, last));
+        return;
+    }
+    if last - first == 1 {
+        // One page and it refuses: noted, and left to `writes` from here on.
+        UNWATCHABLE.set(first);
+        return;
+    }
+    let middle = first + (last - first) / 2;
+    ask_split_within(first, middle, asked, written, budget);
+    ask_split_within(middle, last, asked, written, budget);
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -839,13 +940,36 @@ fn note_shared(written: &[(usize, u16)]) -> u64 {
     now
 }
 
+/// Whether a range known to be view memory skips the kernel asking even
+/// without `VICTORY_PORT_GUARD=1` (`VICTORY_SKIP_VIEW_ASK=0` turns it off).
+///
+/// The kernel keeps no write watch for views, so `GetWriteWatch` refuses any
+/// range that covers one; asked with others it fails their asking too, which
+/// then went to the guards block by block. Knowing the views lets the range
+/// go to the guards at once, without the port guard's own parallel path
+/// (renderer port #6's `mprotect` machinery), which was what the switch
+/// gated. `abx` (2026-11-27): 347 askings refused a frame, 516 guard walks
+/// over 8,949 MB.
+fn skip_view_ask() -> bool {
+    if port_guard() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let default_on = || std::env::var_os("VICTORY_SKIP_VIEW_ASK").is_none_or(|v| v != "0");
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_SKIP_VIEW_ASK").unwrap_or_else(default_on);
+    #[cfg(not(feature = "diagnostics"))]
+    let on = default_on();
+    *ON.get_or_init(|| on)
+}
+
 /// Whether the kernel would refuse to ask about `[start, end)` for its view
 /// memory (renderer port #6): read-only by our hand, or known a view
 /// ([`VIEWS`]). Such a range is left to [`writes`], which goes to the guards
 /// at once; asked with others it failed their asking too, which was then
 /// asked again by halves.
 fn refused_as_view(start: usize, end: usize) -> bool {
-    if !port_guard() || !light() {
+    if !skip_view_ask() || !light() {
         return false;
     }
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -1091,16 +1215,19 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         let (first, last) = alone_ranges[r];
         #[cfg(feature = "diagnostics")]
         let asking = std::time::Instant::now();
-        let found = kernel_written(first, last);
+        // A range the kernel refuses is taken apart by halves, so that one
+        // page it will not ask about costs that page and not the range
+        // ([`UNWATCHABLE`]). What is asked stands in `ahead`; what refuses is
+        // left to `writes`, which guards it or copies it.
+        let (mut asked, mut pages) = (Vec::new(), Vec::new());
+        ask_split(first, last, &mut asked, &mut pages);
         #[cfg(feature = "diagnostics")]
-        alone(first * PAGE, last * PAGE, found.as_ref().map_or(0, Vec::len), asking.elapsed());
-        found
+        alone(first * PAGE, last * PAGE, pages.len(), asking.elapsed());
+        (asked, pages)
     });
-    for (&(first, last), found) in alone_ranges.iter().zip(answers) {
-        if let Some(pages) = found {
-            written.extend(pages);
-            ahead.push((first, last));
-        }
+    for (asked, pages) in answers {
+        written.extend(pages);
+        ahead.extend(asked);
     }
     note_hot(&written);
     // A number of its own, and the one this asking stands under: between
@@ -1226,6 +1353,14 @@ fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
 /// asked to `asked` and the pages found written to `written`.
 fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
     if pieces.len() < 2 {
+        // One piece left: asked in the parts the kernel will take, by halves
+        // down to the page that refuses, so that one page it will not ask
+        // about does not cost the piece — which is the whole heap when the
+        // piece is a copy (`gd1`: 516 watches walking 8.9 GB a frame to find
+        // 60 MB changed).
+        if let Some(&(first, last)) = pieces.first() {
+            ask_split(first, last, asked, written);
+        }
         return;
     }
     let first = pieces[0].0;
@@ -1654,7 +1789,7 @@ static VIEWS: Bits = Bits::new();
 /// Whether a block of `[first, last)` is known view memory and the kernel
 /// need not be asked ([`VIEWS`]).
 fn known_views(first: usize, last: usize) -> bool {
-    port_guard() && light() && VIEWS.any(first, last)
+    skip_view_ask() && light() && VIEWS.any(first, last)
 }
 
 /// A bit per block of the address space, in pieces made when first needed
@@ -2798,11 +2933,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     let rest = rest();
+    // Known for a view from now on, whether or not the port guard's own
+    // parallel path is on: the asking would be refused, and the guards find
+    // what was written anyway (`skip_view_ask`).
+    if skip_view_ask() && !VIEWS.all(first, last) {
+        (first..last).for_each(|block| VIEWS.set(block));
+    }
     if port_guard() {
-        // (Renderer port #6: known for a view from now on.)
-        if !VIEWS.all(first, last) {
-            (first..last).for_each(|block| VIEWS.set(block));
-        }
         return Some(guard_shared(first, last, &came, rest));
     }
     let mut g = guards_timed();

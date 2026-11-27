@@ -943,6 +943,30 @@ pub(crate) struct Memory {
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+    /// Set when it was given by `VirtualAlloc` with `MEM_WRITE_WATCH`, so
+    /// `Drop` gives it back with `VirtualFree` and the kernel can answer
+    /// `GetWriteWatch` about it (`VICTORY_WATCH_HEAP`).
+    watched: bool,
+}
+
+/// Whether the memory we hand the title for its resources is write-watched
+/// (`VICTORY_WATCH_HEAP=0` turns it off).
+///
+/// `GetWriteWatch` refuses a range whole if one page in it is not
+/// write-watchable, and the kernel only keeps a write watch for private
+/// memory given by `VirtualAlloc(..., MEM_WRITE_WATCH)`. Our heap was plain
+/// `alloc_zeroed`, so every copy that covered one of these allocations was
+/// refused and fell to `writes`, which walks the guards block by block
+/// instead: 516 walks over 8,949 MB a frame, 16.4 ms, to find 60 MB changed
+/// (`abx`, 2026-11-27). Watched, those copies are answered by the kernel.
+fn watch_heap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let default_on = || std::env::var_os("VICTORY_WATCH_HEAP").is_none_or(|v| v != "0");
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_WATCH_HEAP").unwrap_or_else(default_on);
+    #[cfg(not(feature = "diagnostics"))]
+    let on = default_on();
+    *ON.get_or_init(|| on)
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -1020,6 +1044,7 @@ impl Memory {
             ptr,
             layout,
             attributes: Some(attributes),
+            watched: false,
         })
     }
 
@@ -1039,6 +1064,43 @@ impl Memory {
             .filter(|&(size, _)| size > 0)
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
+        // Write-watched private memory where it can be had: the kernel then
+        // answers `GetWriteWatch` about the copies that cover it, instead of
+        // refusing them and making the guards walk the blocks (`watch_heap`).
+        #[cfg(windows)]
+        if watch_heap() && layout.align() <= 64 * 1024 {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            // (Not in windows-sys' memory module.)
+            const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+            // SAFETY: a fresh private allocation of a non-zero size; zeroed
+            // by the kernel for `MEM_COMMIT`.
+            let raw = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    layout.size(),
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            };
+            if let Some(ptr) = NonNull::new(raw.cast::<u8>()) {
+                crate::watch::title_memory_allocated(ptr.as_ptr() as usize, layout.size());
+                if info.size >= 32 << 20 {
+                    tracing::info!(
+                        mb = info.size >> 20,
+                        at = ?ptr,
+                        "memory for the title from our allocator, write-watched"
+                    );
+                }
+                return Ok(Memory {
+                    ptr,
+                    layout,
+                    attributes: None,
+                    watched: true,
+                });
+            }
+        }
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
         // The big ones are named in the log: the memory line counts our own
@@ -1051,12 +1113,23 @@ impl Memory {
             ptr,
             layout,
             attributes: None,
+            watched: false,
         })
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.watched {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            // What the GPU side noted of the memory goes first: the address
+            // may be other memory's the moment it is free.
+            crate::watch::title_memory_freed(self.ptr.as_ptr() as usize, self.layout.size());
+            // SAFETY: given by `VirtualAlloc` in `new`.
+            unsafe { VirtualFree(self.ptr.as_ptr().cast(), 0, MEM_RELEASE) };
+            return;
+        }
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.

@@ -336,6 +336,47 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    // The big ones write-watched: `GetWriteWatch` refuses a range whole if
+    // one page in it is not write-watchable, and only `VirtualAlloc` with
+    // `MEM_WRITE_WATCH` makes private memory watchable. The title's large
+    // buffers (its 21 MB one among them) come through here, and a copy that
+    // covered one was refused whole and fell to the guards (`watch_xmem_alloc`).
+    if size >= PAGE && layout.align() <= PAGE && watch_xmem_alloc() {
+        if let Some(total) = layout.size().checked_add(PAGE) {
+            // SAFETY: a fresh private allocation; the page before `user`
+            // holds the header, so `user` is 64 KiB-aligned.
+            let base = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    total,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            }
+            .cast::<u8>();
+            if !base.is_null() {
+                // SAFETY: `total >= PAGE + size`, `HEADER <= PAGE`.
+                let user = unsafe {
+                    let user = base.add(PAGE);
+                    // (A size of `usize::MAX` says the block is a watched
+                    // `VirtualAlloc` and its base is in the second word.)
+                    user.sub(HEADER)
+                        .cast::<[usize; 2]>()
+                        .write([usize::MAX, base as usize]);
+                    user
+                };
+                victory_gpu::title_memory_allocated(user as usize, size);
+                if size >= MIB {
+                    tracing::info!(
+                        at = format_args!("{user:p}"),
+                        size = format_args!("{size:#x}"),
+                        "XMemAllocDefault watched"
+                    );
+                }
+                return user.cast();
+            }
+        }
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -371,11 +412,35 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if size == usize::MAX {
+            // A watched `VirtualAlloc` block: the base is the second word
+            // (`XMemAllocDefault`).
+            let _changing = victory_gpu::title_memory_remapping();
+            victory_gpu::title_memory_freed(align, 0);
+            VirtualFree(align as *mut c_void, 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
         );
     }
+}
+
+/// Whether large (>= 64 KiB) [`XMemAllocDefault`] blocks are given
+/// write-watched private memory (`VICTORY_WATCH_XMEM_ALLOC=0` turns it off).
+///
+/// A copy that covers a block the kernel cannot be asked about is refused
+/// whole and falls to the guards, which walk its blocks: the title's 21 MB
+/// buffer did that every frame. Watched, the kernel answers it.
+fn watch_xmem_alloc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let default_on = || std::env::var_os("VICTORY_WATCH_XMEM_ALLOC").is_none_or(|v| v != "0");
+    #[cfg(feature = "diagnostics")]
+    let on = victory_gpu::switched("VICTORY_WATCH_XMEM_ALLOC").unwrap_or_else(default_on);
+    #[cfg(not(feature = "diagnostics"))]
+    let on = default_on();
+    *ON.get_or_init(|| on)
 }
 
 /// A retail console has no tools memory.
