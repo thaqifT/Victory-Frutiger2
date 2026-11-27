@@ -361,3 +361,68 @@ The same run's `copies per frame` line is where the next lever is:
 9.3 GB of ranges are checked every frame and 99.4 % of it is unchanged, so the
 *walk over the journal's written pages* costs more than the copies it protects.
 That is what `nothing_new` walks, and it is why the filter above lost.
+
+### The library's slack was never mapped (`b37d58a8`, `gd12`)
+
+`898c769e` fixed the boot crash by mapping `Mapped::SLACK` (0x4000) bytes of
+zeroes after `host-pipelines.bin`, so that the two bytes `amdxc64.dll` reads
+past the end of the blob land in mapped memory. It did not do that. It passed
+`len + SLACK` as the mapping object's size, and Windows refuses a view larger
+than the file:
+
+    file   671,742 bytes
+    slack 0       -> ok    (view 671,742)
+    slack 0x1000  -> CreateFileMappingW failed 8
+    slack 0x4000  -> CreateFileMappingW failed 8
+
+`8` is `ERROR_NOT_ENOUGH_MEMORY`, and it comes back from `CreateFileMappingW`
+itself, not from `MapViewOfFile`. So `Mapped::map` returned `None`, `Blob::of`
+fell through to `std::fs::read`, and **the library has been held in a heap
+buffer in every run since**. The log line says so and was never read:
+
+    host pipeline library loaded bytes=671742 mapped=false
+
+The crash stopped because the driver's two bytes past the end landed in the
+heap allocation's rounding instead of an unmapped page. The fix worked by
+accident, and the accident was "stop mapping".
+
+What it is now: `Blob::read_padded` reads the file into a buffer of
+`len + 0x4000` and truncates the length, so the slack is in the same allocation
+and `Blob::bytes` does not show it. `Mapped::map` takes no slack parameter --
+a view ends exactly at the file's last byte and cannot carry any. Mapping is
+off by default (`VICTORY_LIBRARY_MAP=1` to turn it on); saves still go through
+a mapping, which is what `Mapped::create` was always for.
+
+The two tests `898c769e` left failing now pass, and they were failing on `HEAD`
+too -- they are the record that the mapping was gone:
+
+    the_library_file_is_mapped_and_replaced ... ok
+    a_replaced_library_file_still_reads_from_the_disk ... ok
+
+### The three locks in `nothing_new_at` are not the cost (`gd12`)
+
+`nothing_new_at` takes `pending`, `copied` and `ranged`, and 5,579 spans a
+frame pay for all three. Made them cheap: `copied` became an `RwLock` (read by
+every refresh, written by few), `ranged` became six atomics (it is always
+touched under `copied`'s lock anyway, so they are free), and `pending` grew a
+`pending_len` counter so the checks that would take its lock only to find it
+empty skip it.
+
+Measured, same switches, same ~5,500 spans:
+
+| | checks median | checks mean |
+|---|---|---|
+| `gd10` (before) | 4.9 ms | 3.92 ms |
+| `gd12` (after) | 5.1 ms | 3.90 ms |
+
+No change. The locks were not the cost; the journal walk inside
+`crate::watch::nothing_new` is, and `be8543c8` already took the cache misses out
+of it. Reverted. `nothing_new` is ~5 ms of all threads' time in a 175 ms frame
+-- even deleting it entirely is 3 % -- so it is not where the frame goes.
+
+Where the frame does go (`gd10`, world band, medians): 45.3 ms preparing,
+82.4 ms on the GPU, 24.1 ms copying back. `VICTORY_RENDER_SCALE=0.5` in `gd11`
+cut the pixels 44 % and the GPU time only 82.4 -> 71.1 ms, so the GPU is not
+fill-bound; it is geometry, compute or barriers. The host runs real mesh
+shaders (`host mesh shader support mesh=true`, tier 1, shader model 6.6 on the
+RX 6800), so amplification is not being emulated either.
