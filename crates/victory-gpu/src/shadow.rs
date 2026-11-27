@@ -3995,6 +3995,10 @@ impl Shadow {
                 if a > at {
                     bytes += self.update_free(at, a);
                 }
+                // Inside the range the title's own writes are the input the
+                // shader reads: taken in, though the range belongs to the
+                // card (`take_title_writes`).
+                bytes += self.take_title_writes(a.max(from), e.min(to));
                 at = at.max(e);
             }
             if at < to {
@@ -4003,6 +4007,41 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// The title's CPU writes inside `[from, to)` where shaders are writing
+    /// too: copied into the copy, since [`Shadow::update`] skips the whole
+    /// range otherwise and the card would read the bytes from before them.
+    ///
+    /// A range shaders write is the card's: the refresh leaves it alone so
+    /// the card's output is not clobbered before it is merged back. But the
+    /// title writes that range as well — a constants fill, a matrix — and
+    /// those bytes are what the shader reads. Taking only the pages the
+    /// write journal names written since they were last copied leaves the
+    /// card's own output alone.
+    ///
+    /// `VICTORY_PENDING_TAKE=0` turns it off (the A/B, and the way back).
+    fn take_title_writes(&self, from: usize, to: usize) -> usize {
+        /// Ranges bigger than this are the card's alone: asking about all of
+        /// one every submission is what the gap-by-gap refresh exists to
+        /// avoid (the 174 MB heap's views are declared whole).
+        const MOST: usize = 256 * 1024;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if from >= to || to - from > MOST {
+            return 0;
+        }
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_PENDING_TAKE").is_none_or(|v| v != "0")) {
+            return 0;
+        }
+        let Some((now, written)) = crate::watch::writes(from, to, true) else {
+            return 0;
+        };
+        if written.is_empty() {
+            return 0;
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PendingTaken, (to - from) as u64);
+        self.copy_stale(from, to, now, &written)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
@@ -4092,9 +4131,19 @@ impl Shadow {
         static SAID: AtomicU64 = AtomicU64::new(0);
         let start = self.start as usize;
         let mut title = [0u8; SAMPLE];
+        // Blocks the card is writing (or wrote and the merge has not taken
+        // yet) are expected to differ from title memory: that is the merge
+        // direction, not a stale read. The instrument is for copies the card
+        // only reads.
+        let pending: Vec<(usize, usize)> =
+            self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
         let mut at = from;
         while at < to {
             let n = SAMPLE.min(to - at);
+            if pending.iter().any(|&(a, e)| a < at + n && e > at) {
+                at = (at / PAGE + 1) * PAGE;
+                continue;
+            }
             if crate::host::read_into(at as *const u8, &mut title[..n]) {
                 // SAFETY: `[from, to)` lies inside the buffer (`update`),
                 // so these bytes are inside the copy's mapping.

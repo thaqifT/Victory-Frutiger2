@@ -5373,6 +5373,23 @@ impl Host {
         let _ = self.submit(runs, &[], false);
     }
 
+    /// [`Host::execute`] of several parts of a queue's held submissions in
+    /// one: `parts` names the list each part begins at, as [`execute_parts`]
+    /// does for the relay's. Waited for once, at the end of the last part.
+    ///
+    /// Why: on this title the card runs a submission in 1.85 ms and then
+    /// sits idle 2.88 ms until the next (timeline: 36.3 submissions a frame,
+    /// 66.99 ms running, 104.40 ms idle between them). 5-9 of those round
+    /// trips a frame are parts standing at waits that are met already
+    /// (`C::PartsTogether`, `queue::ready_part`), and each one costs a card
+    /// turnaround for nothing.
+    pub(crate) fn execute_parts_waited(&self, lists: &[crate::list::Detached], order: &[usize], parts: &[usize]) {
+        // Behind what the title's queues were given before it.
+        crate::queue::before_sync();
+        let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+        let _ = self.submit(&runs, parts, false);
+    }
+
     /// A queue's submission with [`late`]: the host lists `lists`, taken
     /// from the title's, go to the card in `order` and are not waited for.
     /// They join the line of flights and are settled, with the others in

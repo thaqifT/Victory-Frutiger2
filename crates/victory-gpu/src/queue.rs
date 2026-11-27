@@ -364,20 +364,6 @@ pub(crate) fn release_held(all: bool) {
                                 order.len()
                             )
                         });
-                        // Diagnostics: the part behind this one stands at
-                        // waits that are met already, so the two could have
-                        // been one host submission (one wait for the card,
-                        // each range shaders write compared once).
-                        #[cfg(feature = "diagnostics")]
-                        {
-                            let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
-                            if waits > 0
-                                && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
-                            {
-                                crate::copystat::add(crate::copystat::C::PartsTogether, 1);
-                            }
-                        }
                         if crate::host::late()
                             && let Some(host) = crate::host::host()
                         {
@@ -385,12 +371,24 @@ pub(crate) fn release_held(all: bool) {
                             // until they are settled.
                             host.execute_late(lists, order);
                         } else {
+                            // Parts behind this one that stand at waits met
+                            // already go to the card with it: one turnaround
+                            // instead of one each.
+                            let (lists, order, parts) = if all || !joins_ready() {
+                                (lists, order, Vec::new())
+                            } else {
+                                join_ready(&mut held, lists, order)
+                            };
                             let ran = {
                                 let runs: Vec<&crate::host::HostList> =
                                     order.iter().map(|&i| lists[i].host()).collect();
                                 match crate::host::host() {
                                     Some(host) => {
-                                        host.execute(&runs);
+                                        if parts.is_empty() {
+                                            host.execute(&runs);
+                                        } else {
+                                            host.execute_parts_waited(&lists, &order, &parts);
+                                        }
                                         true
                                     }
                                     None => false,
@@ -430,6 +428,59 @@ pub(crate) fn release_held(all: bool) {
             break;
         }
     }
+}
+
+/// Whether ready parts are joined into one submission
+/// (`VICTORY_JOIN_READY=0` turns it off: the A/B, and the way back if a title
+/// ever reads a copy the part it was joined to was to refresh first).
+#[cfg(windows)]
+fn joins_ready() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_READY").is_none_or(|v| v != "0"))
+}
+
+/// `lists` and `order` with the parts behind them in `held` that stand at
+/// waits met already joined on: one submission, `parts` naming the list each
+/// part begins at.
+#[cfg(windows)]
+fn join_ready(
+    held: &mut Vec<Held>,
+    mut lists: Vec<crate::list::Detached>,
+    mut order: Vec<usize>,
+) -> (Vec<crate::list::Detached>, Vec<usize>, Vec<usize>) {
+    let mut parts = Vec::new();
+    while let Some((more, more_order)) = ready_part(held) {
+        parts.push(order.len());
+        let base = lists.len();
+        lists.extend(more);
+        order.extend(more_order.into_iter().map(|i| i + base));
+    }
+    (lists, order, parts)
+}
+
+/// The run behind the met waits at the front of `held`, taken off it.
+///
+/// `None` when the front is not a run behind waits all met: a wait not met,
+/// a fence, or a signal stops the join, since each of those is a point the
+/// card has to reach before what follows it may run.
+#[cfg(windows)]
+fn ready_part(held: &mut Vec<Held>) -> Option<(Vec<crate::list::Detached>, Vec<usize>)> {
+    let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+    if waits == 0 || !held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met())) {
+        return None;
+    }
+    if !matches!(held.get(waits), Some(Held::Run(..))) {
+        return None;
+    }
+    held.drain(..waits);
+    let run = match held.remove(0) {
+        Held::Run(lists, order) => (lists, order),
+        // The run checked for just above; nothing else was taken off.
+        _ => return None,
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PartsTogether, 1);
+    Some(run)
 }
 
 /// Before a submission of ours that is waited for, or a wait for flights by

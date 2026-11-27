@@ -68,6 +68,9 @@ pub(crate) enum C {
     /// Bytes copied whole because their memory is neither write-watched
     /// nor a view (`Shadow::update_free`).
     WholeBytes,
+    /// Ranges inside shader-written ranges asked about at a refresh
+    /// (`Shadow::take_title_writes`): the title's own writes there.
+    PendingTaken,
     /// Submissions with ranges shaders write (they need the GPU's results
     /// before they return).
     BackSubmissions,
@@ -1305,7 +1308,8 @@ pub(crate) fn log(frames: f64) {
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
-         guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
+         guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} MB of the title's \
+         own writes taken inside shader-written ranges (VICTORY_PENDING_TAKE); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
          {:.0} steps {:.1} MB left out",
         c[C::RecordCalls as usize],
@@ -1322,6 +1326,7 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::SparseUs as usize]),
         ms(c[C::GuardUs as usize]),
         mb(c[C::WholeBytes as usize]),
+        mb(c[C::PendingTaken as usize]),
         c[C::PaceWaits as usize],
         ms(c[C::PaceUs as usize]),
         c[C::GpuWritesLeftOut as usize],
