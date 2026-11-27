@@ -210,3 +210,95 @@ measured separately. The remaining ~5.8 ms is the span build and the
 `VICTORY_WIDE_SPIN=500` was measured against this (`rf1`) and is a wash:
 refreshes 20.2 -> 19.1 ms in the matched 95-180 s window, for four cores
 spinning. Stays 0.
+
+## The boot crash: the guard was watching the wrong address
+
+`amdxc64.dll+0x176cd5` faults ~50% of boots while it compiles the pipeline for
+one vertex and one pixel program. The fault reads `0x19905a14000` -- two bytes
+past the end of a mapped blob, i.e. the compiler walking a shader it was handed.
+
+We already had a guard for exactly this: `pipeline::make::compiler_crashed`,
+installed as a vectored handler, which notes the fault, sleeps the worker for
+good, and lets the watcher leave that one pipeline out (`warm-bad.txt`) and
+start another worker. It is on by default (`VICTORY_COMPILER_GUARD`).
+
+It never fired. Its first test was
+
+    record.ExceptionInformation[1] >= 0x10000  ->  CONTINUE_SEARCH
+
+`ExceptionInformation[1]` is the faulting address, and the guard only took
+faults *below* 64 KiB -- "an access of the first pages in `amdxc64.dll`", the
+null-deref shape it was written for on an RX 9070 XT. Our fault is at
+`0x19905a14000`. The guard stepped aside, the access violation went unhandled,
+and the process died before any pipeline could be left out. That is why no
+`warm-bad.txt` was ever written, and why the crash looked unguardable.
+
+The address was never the thing worth judging. The thread already says it: the
+handler runs only when `COMPILING` is set, which is only set on a pipeline
+worker inside a compile, and `WORKER_SLOT` must name that worker. The address
+is now recorded and reported, not tested.
+
+Effect: a boot that hits this should survive with one pipeline missing instead
+of dying. The log line to look for is
+
+    the driver's compiler crashed making a pipeline: it is left out, the worker is replaced
+
+with `rip` and `address` on it, and the key appended to `pipelines\warm-bad.txt`
+so the next boot skips it outright.
+
+The malformed shader itself is still there. This buys the boot, not the pixels:
+whatever that pipeline drew goes without a host pipeline, as the title's own
+missing pipelines already do.
+
+### Correction: the guard was not the fix, and the fault is not the shader
+
+Two runs after the guard change say so.
+
+`gd2` (guard on): the guard fired, exactly as intended --
+
+    the driver's compiler crashed making a pipeline: it is left out, the worker is replaced
+    key="c3d97bacccf970b61be9a46d23db5118" shaders=[vertex dfafaf385b2f94e8, pixel 06295fb1d1aefb78]
+
+-- and the process lived. It then sat at 2.0 fps and **0 draws/frame** for the whole
+run. A frozen boot is not a boot.
+
+`gd3` (next boot, key now in `warm-bad.txt`): the pipeline was skipped before any
+compile --
+
+    WARN ... not made: the driver's compiler crashed on it before key="c3d97..."
+
+-- and **the same fault fired anyway**, on a thread that is not a pipeline worker:
+
+    first-chance 0xc0000005 at amdxc64.dll+0x176cd5 (read 0x1cf83a04000)
+    r13 0x1cf83a03ffe  r14 0x1cf83a03ffe  r15 0x11f3
+
+Same `r15`, same `...3ffe`, same call stack. So the crash is not the pipeline being
+made, and leaving that pipeline out does not prevent it.
+
+The two shaders are fine. `VICTORY_SHADER_SAVE` dumped them (`gd4`), 3035 B of vertex
+and 1983 B of pixel, and both pass Microsoft's own validator:
+
+    DXIL  2 emitted of 2 vertex and pixel programs; 2 validated, 0 pipelines
+
+### What it actually is: a mapped file two bytes short of a page
+
+The host pipeline library is not read into memory, it is **mapped**
+(`pipeline/library.rs`, `Mapped`), and D3D12 keeps reading the bytes it was handed
+for as long as the library lives. The mapping is the file's size rounded up to a
+page, so a view that ends on a page has nothing mapped past it.
+
+    host-pipelines.bin   671,742 bytes
+    164 * 4096           671,744
+    671742 = 671744 - 2
+
+Two bytes short of a page. `amdxc64` reads two bytes past the end of the blob it is
+walking -- `r13 = 0x...3ffe`, read at `0x...4000` -- and on a mapping that ends there
+the read lands on an unmapped page. The size of that file drifts as pipelines are
+saved, which is why the fault came and went between boots instead of always firing.
+
+The fix is slack: map four pages of zeroes past the library's own bytes
+(`Mapped::SLACK`, read mappings only -- a writable mapping larger than the file would
+grow it). The compiler's two bytes now land in mapped zeroes.
+
+The guard stays: it is what named the shader pair and what keeps a crash on a worker
+from ending the process. But it is a net under the real floor, not the floor.
