@@ -2366,7 +2366,14 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 /// landings do not come here: `crate::land` has threads of its own.)
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    // On by default; `VICTORY_WIDE_MERGE=0` turns it off. It was opt-in until
+    // it was measured: cb5 (serial) 440 pieces in 11.0 ms, 671 in 23.6, 859 in
+    // 30.2; cb6 (this, eight threads) 405 in 9.8, 670 in 19.5, 808 in 23.1,
+    // and a matched pair of in-world frames put copy-back at 13.9 ms against
+    // 26.4 for the same 1,460 draws. Less than eight times better because the
+    // pieces contend on the watch's guards and on `watch::landing`'s pages,
+    // which is why the gain is 7-9 ms of the frame and not 25.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
 /// One declared range of a copy in the card's memory, in a submission.

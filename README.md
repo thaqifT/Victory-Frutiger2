@@ -110,6 +110,7 @@ window, and closed on evidence. They are written down so nobody re-tests them.
 | card-buffer pair `MIN_KB=64` / `MB=1536` | loses badly, 217.7 ms against 123.7; mapping causes explode |
 | `VICTORY_CARD_BUFFERS_MIN_KB=64` | neutral: 141.7 ms against 144.1 at matched draws, for 1,129 MB of card memory and 15,661 pieces compared |
 | card-buffer floor 4 MiB -> 1 MiB on 16 GB cards | **a win, and now the default**: CPU compare 80.3 -> 30.2 MB, copy-back 43.4 -> 24.7 ms a frame, for 91 MB more card memory out of 2,048 |
+| `VICTORY_WIDE_MERGE` (the card's own merge on eight threads) | **a win, and now the default**: 405-808 pieces in 9.8-23.1 ms against the serial 440-859 in 11.0-30.2; copy-back 13.9 ms against 26.4 at the same 1,460 draws |
 | `VICTORY_LATE_*` | removes the device within 40–110 s with every knob off |
 
 Two fixes that **did** land and are proven:
