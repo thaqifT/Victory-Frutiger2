@@ -1010,3 +1010,42 @@ an RTX 2080 Ti, and this port's whole business is that the card and our
 preparing already run at the same time — which is exactly the overlap this
 build is short of. It is worth having as a switch for a frame that shows a
 wedge, not as a default.
+
+### The late path is what wedges the card, not the relay
+
+`hp2` ran `VICTORY_LATE_WAIT=1;VICTORY_HEAP_SYNC_PACE=1` — the late path on its
+own, without the relay, with the heaps paced. It died at 126 s:
+
+```
+ERROR device-removed data; breadcrumbs (done/count, list) []
+ERROR host GPU device removed after 4 submissions sent ahead (VICTORY_LATE_WAIT=1)
+      of 27 lists; breadcrumbs (done/count, list) []
+```
+
+**Four submissions sent ahead.** Same empty breadcrumbs as `rel2` and `rel3`.
+So the wedge is not the relay's landing thread and not its waits — it is the
+sent-ahead path itself, which the relay needs and which `VICTORY_LATE_WAIT`
+turns on. That closes the last cheap question in the relay's stack: there is
+nothing left to bisect, because the thing underneath it is already broken.
+
+**Heap pacing held nothing.** `hp2` also ran `VICTORY_HEAP_SYNC_PACE=1` with the
+late path on, and across 108 pacing lines in the world the count was:
+
+```
+heap pacing (VICTORY_HEAP_SYNC_PACE=1): 30.7 submissions a frame,
+  0.00 held a frame, 0.00 ms a frame held, 0 gave up after 250 ms
+```
+
+Every one of them zero — max 0.00 held a frame over the whole run. So on this
+title the card has already finished the newest frame we sent by the time the
+next submission begins: our preparing and the card's drawing are already not
+overlapping, which is the same thing the frame budget says from the other side
+(preparing 31 ms, then 77 ms on the GPU, one after the other). The wedge
+mechanism heap pacing exists to prevent cannot be happening here, and the
+switch buys nothing. It stays in the tree, off, for a frame that shows a
+stretched triangle.
+
+That is worth stating plainly because it changes what the next session should
+do: **there is no overlap to win back on this title's submission path.** The
+frame is 31 ms of preparing plus 77 ms of card, in series, and the only levers
+left are on the terms themselves.
