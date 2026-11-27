@@ -8756,9 +8756,25 @@ impl Batch {
             let on = default_on();
             on
         }
+        /// Whether those known to copy nothing are dropped before the threads
+        /// are woken, however many there are (`VICTORY_REFRESH_FILTER=1`: off,
+        /// the rest on the threads). Measured in gd7/gd8 and it loses: the
+        /// world's frames went from 17-18 ms of refreshes to 34.4, because
+        /// `Shadow::nothing_new` is not cheap -- it takes three locks and walks
+        /// the journal's written pages -- and done one after another it pays
+        /// ~7 microseconds a span where eight threads paid ~3. Off.
+        fn refresh_filter() -> bool {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let default_on = || *ON.get_or_init(|| std::env::var("VICTORY_REFRESH_FILTER").is_ok_and(|v| v.trim() == "1"));
+            #[cfg(feature = "diagnostics")]
+            let on = crate::ab::pick("VICTORY_REFRESH_FILTER").unwrap_or_else(default_on);
+            #[cfg(not(feature = "diagnostics"))]
+            let on = default_on();
+            on
+        }
         let mut spans = spans;
         let few = if refresh_wide() { 16 } else { 256 };
-        let many = spans.len() > few || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
+        let many = !refresh_filter() && (spans.len() > few || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4);
         if !many {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]

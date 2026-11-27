@@ -302,3 +302,62 @@ grow it). The compiler's two bytes now land in mapped zeroes.
 
 The guard stays: it is what named the shader pair and what keeps a crash on a worker
 from ending the process. But it is a net under the real floor, not the floor.
+
+## Three clean boots, and the refresh filter that lost
+
+The slack holds. Three runs, none of them faulting:
+
+| run | seconds | menu | world from | peak working set |
+|---|---|---|---|---|
+| `gd6` | 110 | 30 fps / 12 draws from 8 s | 69 s, 402 -> 4,539 draws | 20,996 MB |
+| `gd7` | 200 | 30 fps / 13 draws from 7 s | 67 s, 251 -> 5,527 draws | 21,477 MB |
+| `gd8` | 191 | 30 fps / 13 draws from 8 s | 68 s, 309 -> 7,760 draws | 22,268 MB |
+
+All three: 0 first-chance exceptions, 0 unhandled, 0 BacktraceBreakpad reports,
+0 `ERROR` lines, 0 panics, 0 device removals. `gd8` ended on its own at 191 s
+with the log's last lines being pipeline binds, not a fault.
+
+`gd7`'s matched band (95-180 s) is the new baseline for the world:
+
+    138-146 ms/frame = 41-42 preparing (copies 18-19 ms / 73-79 MB,
+    textures 0.6-1.3 ms) + 71-73 on the GPU + 19-20 copying back (25-27 MB)
+
+### `VICTORY_REFRESH_FILTER` -- measured, and off
+
+A world frame's 59 flushes hand over ~5,141 refreshes and 4,981 of them find
+nothing to copy (`gd6`: 5,858 spans, 4,981 known empty). The idea was to drop
+the empty ones on the submitting thread for every flush instead of waking eight
+threads to find out.
+
+It loses. `gd7` (off) against `gd8` (on), same machine, same switches:
+
+| | refreshes | lists' steps |
+|---|---|---|
+| `gd7`, filter off | 16.9-18.2 ms | 22.0-23.8 ms |
+| `gd8`, filter on | 34.4 ms | 53.6 ms |
+
+`Shadow::nothing_new` is not the cheap check it looks like: it takes three
+mutexes (`pending`, `copied`, `ranged`) and then walks the journal's written
+pages. Eight threads pay ~3 us a span for that; one thread after another pays
+~7 us, and there are thousands of spans. The switch stays, defaulting off, with
+these numbers in its doc comment.
+
+### What the copy instrument says (`VICTORY_COPY_SPLIT`, `gd8`)
+
+    14,706 calls, 49.67 ms, 191.7 MB, 3,378 ns a call, 3.9 GB/s
+      <=64KiB   2,349 calls  12.75 ms   61.5 MB
+      <=1MiB      512 calls  36.56 ms  124.0 MB
+
+Two buckets hold 96 % of the time, and both move large pieces: the cost is
+bandwidth, not the per-call overhead `VICTORY_FILLS_PLAIN` was written for
+(1,564 calls of 64 B and under cost 0.01 ms together). `safecopy::copy` is
+already one `rep movsb`, so the 3.9 GB/s is the copy itself, not a kernel call.
+
+The same run's `copies per frame` line is where the next lever is:
+
+    8,175 refreshes 9,519 MB, moves 15.74 ms
+    457 watches 23.73 ms, 9,315 MB checked, 9,255 MB unchanged
+
+9.3 GB of ranges are checked every frame and 99.4 % of it is unchanged, so the
+*walk over the journal's written pages* costs more than the copies it protects.
+That is what `nothing_new` walks, and it is why the filter above lost.
