@@ -19,6 +19,12 @@
 //! What a frame's end is: the fence value signalled behind its present's copy
 //! to the back buffer ([`sent`]). A held submission gives up after [`MOST_MS`]
 //! (counted), so that a frame that never ends cannot stop us.
+//!
+//! It only engages where the flights are in the air (`crate::host::late`), the
+//! same guard upstream uses: without that path a submission is waited for
+//! before the next begins, so the card is never still drawing our previous one
+//! and there is no overlap left to pace. `hp1` ran the switch with the late
+//! path off and its own line said so — `0.0 submissions a frame, 0.00 held`.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
