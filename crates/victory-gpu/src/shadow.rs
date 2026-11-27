@@ -942,12 +942,17 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // On by default (stage 2, `crate::host::relay_exact`); `VICTORY_RELAY=0`
-    // turns it off, `=1` asks for the first stage.
+    // Off by default, in every build. It was on by default here for a while
+    // and that was wrong: `VICTORY_RELAY=1` and `=2` both remove the device on
+    // this title (`0x887A0007`, and `rel2` shows it is a wedge -- the
+    // breadcrumbs list comes back empty, so nothing of ours was in flight when
+    // the driver reset the card). `run2.ps1` pins it to 0 for that reason, and
+    // a default that only a wrapper knows to turn off is a trap for anyone
+    // who starts `victory.exe` directly.
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "1" || v == "2") && !keeps())
 }
 
 /// The submission being prepared (its number among those started): what

@@ -738,3 +738,129 @@ $env:VICTORY_LAND_ECHO='0'      # no take_landed
 Neither was run here. The test is a synthetic harness that mutates the card's
 side by hand, so a pass under either switch would say which mechanism the
 harness is exercising before it says anything about the game.
+
+### Where a world frame's 144 ms goes, after the write-combining skip
+
+`wc2` and `wc3`, world frames only, with `VICTORY_SKIP_WC_BACK` on. The frame
+line splits into four terms and one of them is not on the line at all:
+
+| term | ms | where it is |
+|---|---|---|
+| preparing | 40.3 | `PREPARING`, on the submitting thread |
+| waiting for the GPU | 80.2 | `SUBMISSION_US[1]` |
+| copying back | 4.8 | `COPY_BACK`, now mostly gone |
+| the title's own recording | ~18.6 | the rest of the wall time |
+
+Preparing itself, from `preparing per frame, the submitting thread`:
+
+- **22.1 ms in refreshes** -- 71 flushes of 9,966 ranges, **8,929 of them
+  known to copy nothing**.
+- 7.4 ms asking the write watch (0.5 of them finding what to ask).
+- 9.4 ms of texture refreshes on all threads.
+
+**The refresh term is the one worth taking next.** 22.1 ms over 9,966 ranges is
+2.2 microseconds a range for ranges that do nothing. `Shadow::nothing_new`
+(`shadow.rs:4086`) is what answers them, and it is not cheap: `pending`,
+`copied` and `ranged` locks, then `watch::nothing_new` (`watch.rs:1629`), which
+walks `published(start, end)` and the journal's notes page by page -- 16 pages
+for each 64 KiB piece. Nothing has measured a cheaper way. `VICTORY_REFRESH_FILTER`
+loses because `nothing_new` done one after another on the submitting thread
+pays ~7 us a span where eight threads pay ~3, and `VICTORY_REFRESH_WIDE` is a
+wash for the same reason.
+
+**The larger term is the 80.2 ms GPU wait running strictly after the 40.3 ms of
+preparing.** Overlap them and the frame is ~104 ms instead of 144. That is the
+relay, and it is blocked on the device removal recorded in the section above.
+### The relay: the card stops with nothing in flight
+
+`VICTORY_RELAY=1` with `VICTORY_D3D12_DRED=full` (`rel2`). It lasted 66 s this
+time and then:
+
+```
+19:39:44.151447Z  WARN  no host list for a prelude
+  error=The GPU device instance has been suspended. (0x887A0005)
+19:39:44.152513Z ERROR  device-removed data; breadcrumbs (done/count, list) []
+19:39:44.152595Z ERROR  no host list for a state prelude; device removed ...
+  The GPU will not respond to more commands ... (0x887A0007)
+```
+
+Two things to read out of that.
+
+**`breadcrumbs []`.** Device-removed data was on with breadcrumbs and markers
+(`crash tracing on (device-removed data) breadcrumbs=true markers=true`), and it
+found **no breadcrumb node at all**. DRED only reports lists that were
+submitted, so an empty list means nothing of ours was in flight when the card
+went. The removal is therefore not a bad command: no command was running.
+
+**0x887A0005, then 0x887A0007.** The first thing to fail is a submission
+(`The GPU device instance has been suspended`), which is what a driver reset
+looks like from the submitting side. `0x887A0007` (`DXGI_ERROR_DEVICE_RESET`)
+follows on the next submission, the state prelude with no host list.
+
+Together: the GPU stopped making progress, the driver reset it, and we found out
+on the next submit. That is a **wedge**, not a fault -- a wait that can never be
+satisfied, or a queue waiting on a signal that was never posted. It is the
+branch the relay was being run to decide between, and it is decided.
+
+**The wrapper eats `-More` commas.** `run2.ps1` splits `-More` on `;`, not `,`
+(line 115). `-More 'VICTORY_RELAY=1,VICTORY_D3D12_DRED=full'` therefore set one
+variable, `VICTORY_RELAY=1,VICTORY_D3D12_DRED=full`, and left DRED at the
+table's `light`. Every earlier run that passed two switches comma-separated did
+the same; `wc2`'s A/B worked only because `crate::ab` splits its own value on
+commas. **Use `;` between switches.**
+### The frame budget, as the lines actually print it
+
+The section above was written from one heavy frame of `wc3` and its refresh
+figure (**22.1 ms**) is not what a steady frame says. Corrected here, from the
+steady lines in `log-wc3.err.txt` (19:33:49 and 19:33:50), so nobody quotes the
+wrong number later.
+
+```
+6.1 fps, 163.9 ms/frame (31.0 preparing: copies 12.3 ms 31.4 MB,
+  textures 0.8 ms 42.9 MB; 77.4 on the GPU; 4.9 copying back 1.0 MB)
+```
+
+| term | ms | share |
+|---|---|---|
+| preparing | 31.0 | 19 % |
+| on the GPU | 77.4 | **47 %** |
+| copying back | 4.9 | 3 % |
+| the title's own recording | ~50.6 | 31 % |
+
+**Preparing, split as the next line splits it:**
+
+```
+preparing per frame, the submitting thread: 7.2 ms asking the write watch
+  (0.6 of them finding what to ask), 0.0 putting the title's bytes under
+  flights' writes, 17.8 in the lists' steps (refreshes 11.4 in 65 flushes
+  of 9166, 8641 of them known to copy nothing, 7805 on several threads,
+  0.9 one at a time in 243 before shader writes; copies and fills 1.7),
+  2.9 snapshots, 2.7 for copies in the card's memory, ...
+  the checks behind those refreshes 9410 spans, 6.8 ms on all threads,
+  9836.8 MB found clean
+```
+
+So the refresh filter is **6.8 ms of thread time**, not 22.1: 9,410 spans at
+0.72 us each, and 7,805 of them run on the eight threads at once. The refresh
+*term* on the submitting thread is 11.4 ms and includes the copies the other
+525 spans do. **The refresh lever is worth about 7 ms, not 20.** It is already
+most of the way to its floor; the earlier note sent the next session after it
+with the wrong prize attached.
+
+**The write watch is the bigger of our own terms, and it is nearly all waste:**
+
+```
+copies per frame: ... 541 watches 11.29 ms, 12832.8 MB checked,
+  12802.2 MB unchanged
+```
+
+11.29 ms to walk **12.8 GB** of page table and find 0.2 % of it written. That
+is 8 % of the frame for a rounding error of signal. It is already past
+`ask_ahead`, `ask_once` and the guard bits; what is left is 541 askings of
+~24 MB each, one per span that actually copies.
+
+**The 77.4 ms on the GPU is the frame, and there is no lever on it that has
+been found.** `VICTORY_GPU_TIMING` (needs `VICTORY_D3D12_DRED=full`) names six
+compute dispatches at 25.9 ms between them; they are single dispatches in the
+title's own shaders. The only remaining structural win is overlapping the
+77.4 with the 31.0 -- the relay -- and that is the wedge in the section above.

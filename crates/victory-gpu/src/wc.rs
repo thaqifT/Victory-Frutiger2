@@ -36,11 +36,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const WRITE_COMBINING: u32 = 0x400;
 
 /// Whether shader writes to write-combining title memory are not copied back.
-/// On by default; `VICTORY_SKIP_WC_BACK=0` puts them back as before.
+/// Off by default; `VICTORY_SKIP_WC_BACK=1` turns it on.
 ///
-/// Measured in `wc2`, world frames only, by the switch state each frame line
-/// carries: `copying back` 21.36 ms / 23.41 MB with it off, 5.08 ms / 1.58 MB
-/// with it on -- 16.3 ms of every frame, and 93 % of the bytes.
+/// It is worth real time. Measured in `wc2`, world frames only, by the switch
+/// state each frame line carries: `copying back` 21.36 ms / 23.41 MB with it
+/// off, 5.08 ms / 1.58 MB with it on -- 16.3 ms of every frame, and 93 % of
+/// the bytes. `wc4` (off) against `wc3` (on) shows it again on the heavy
+/// frames: 36.5 ms / 36.5 MB against 4.9 ms / 1.0 MB.
+///
+/// It is off because it corrupts. `wc3` (on) logged **529** `a black frame
+/// after a frame that was not` warnings, alternating in pairs from frame 2068
+/// on: `levels=[130, 1, 129, 1, 130, 1, ...]`, same resource, `state=0x4`. It
+/// is not a scene being dark -- the probe reads the frame that is presented.
+/// `wc4`, the same run with `VICTORY_SKIP_WC_BACK=0` and nothing else changed,
+/// reached frame 2932 (past the whole of `wc3`'s window) with **3** warnings,
+/// the same three every run logs in its first frames. Every other log on this
+/// machine has 0 to 14.
+///
+/// The mechanism is the one the module header names: title memory where a
+/// shader wrote is left stale, and when the title's CPU reads a buffer it
+/// fills with compute and hands back to the card, it reads a frame behind.
+/// A frame that alternates black and bright is what one of two buffers being
+/// stale looks like.
 pub(crate) fn skip_back() -> bool {
     // Diagnostics: named in `VICTORY_AB`, it changes while the title runs.
     #[cfg(feature = "diagnostics")]
@@ -52,7 +69,7 @@ pub(crate) fn skip_back() -> bool {
         }
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_WC_BACK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_WC_BACK").is_some_and(|v| v != "0"))
 }
 
 /// Whether such a piece is also left out of the card's compare
