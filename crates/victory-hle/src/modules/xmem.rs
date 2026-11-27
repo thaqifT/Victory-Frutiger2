@@ -973,10 +973,10 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
 /// of the GPU's page-mapping copies ([`map_alias`]; calls and milliseconds);
 /// and by system call (unmap, split, map, commit) how many and their
 /// milliseconds.
-static MAPPING: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
+static MAPPING: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 
 pub(crate) fn map_costs() -> Option<String> {
-    let n: [u64; 15] = std::array::from_fn(|i| MAPPING[i].swap(0, Ordering::Relaxed));
+    let n: [u64; 16] = std::array::from_fn(|i| MAPPING[i].swap(0, Ordering::Relaxed));
     let time = |i: usize| matches!(i, 2 | 3 | 4 | 6 | 8 | 10 | 12 | 14);
     (n[0] + n[5] > 0).then(|| {
         let all: Vec<String> = n
@@ -1319,6 +1319,22 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
             };
             slices.push(slice);
         }
+    }
+    // Nothing to do: every page of the range already shows the slice asked
+    // for. The title recycles pool pages into its tiled heap and back, and a
+    // page that already shows the right slice costs an `UnmapViewOfFile2`
+    // and a `MapViewOfFile3` - 0.43 ms for the 1.3 pages of an average copy
+    // (run pm1: 439 ms of every second in these, under the address space's
+    // lock that the guards want too).
+    if !slices.is_empty()
+        && slices.iter().enumerate().all(|(i, want)| {
+            physical
+                .slice_at(to + i * PAGE)
+                .is_some_and(|have| have.index == want.index && Arc::ptr_eq(&have.section, &want.section))
+        })
+    {
+        MAPPING[15].fetch_add(1, Ordering::Relaxed);
+        return true;
     }
     unmap(&mut physical, to, len);
     // One view per run of consecutive slices of one section, as
