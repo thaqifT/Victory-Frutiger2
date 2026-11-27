@@ -923,3 +923,44 @@ because `wc2` never reached the scene -- max 5502 draws against `wc3`'s 8277 --
 and because the warning count for the whole run was 6, which reads like the
 startup noise every log has. The lesson is not "measure"; it is **count the
 warnings, not only the milliseconds, and make sure the run reaches the scene**.
+### Two ports from fxeless, and the one that proves itself
+
+`fxeless/victory-fork` had two open pull requests on 2026-11-27 that touch
+correctness rather than speed. Both are in.
+
+**#1496, a placed page remembers its asking.** `memory::place()` uploads a page
+of title memory at a submission and leaves `held.taken` at 0. The next
+`bring()` reads that as "never taken" (`held.taken == 0` in the `stale`
+expression) and schedules a whole-page upload over whatever the builder has
+already written on the card. Stamping `taken` from `watch::writes` right after
+the upload makes the first refresh see the page as current; a later title write
+still reaches the copy because its asking is higher than the stamp.
+`VICTORY_PLACE_TAKEN=0` keeps the old behaviour.
+
+The test is upstream's, adapted to our shapes: an unchanged placed page uploads
+nothing, and one title dword still lands. It is in `memory::tests` as
+`a_placed_page_is_not_taken_again_until_the_title_writes`.
+
+**#1495, the scalar-code table.** `ir::unspill` keeps `let mut used = [false;
+128]` of scalar codes the program uses, and indexes it with `Reg::S(c)` where
+`c` is a `u8`. A program naming a scalar code of 128 or more panics — measured
+here as `index out of bounds: the len is 128 but the index is 215` at
+`ir.rs:336` — and that shader never translates at all. `free[]` beside it was
+already 256, so the table was the only one short.
+
+**This is the one that proves itself.** With the old size the new test panics
+and the suite goes red; with 256 it passes and `victory-shader` is 304 passed,
+0 failed, 4 ignored. It is the first port in this repo that can be shown to fix
+something without a frame of video.
+
+**`wc5` verifies the shipped write-combining default.** No
+`VICTORY_SKIP_WC_BACK` in the environment at all, so the default is what runs:
+
+| run | skip | max frame reached | black-frame warnings |
+|---|---|---|---|
+| `wc4` | `=0` passed in | 2932 | 3 |
+| `wc5` | default (off) | 2864 | 3 |
+| `wc3` | default (was on) | 3152 | **529** |
+
+The frame lines carry `write-combining skip off`. 98 warnings and errors over
+the run, all of them the usual texture-index and unmirrored-view notes.
