@@ -5343,17 +5343,21 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                // Counted once per piece, as the fetch is: a piece another
+                // range of this frame already claimed is not fetched twice, so
+                // it is not skipped twice either.
+                if lo >= hi || !seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                    continue;
+                }
                 // A piece of write-combining title memory stays on the card
                 // (`crate::wc`, fxeless #868): not fetched, not waited for,
                 // not merged -- and `card_merge`'s read of title memory,
                 // which is the expensive half, never happens for it.
-                if lo < hi && crate::wc::skip_piece(start + lo, hi - lo) {
+                if crate::wc::skip_piece(start + lo, hi - lo) {
                     continue;
                 }
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                    pieces.push((i, lo, hi, total));
-                    total += (hi - lo) as u64;
-                }
+                pieces.push((i, lo, hi, total));
+                total += (hi - lo) as u64;
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
@@ -11173,7 +11177,12 @@ mod refresh_tests {
                         for &(from, to) in &ranges {
                             for at in (from..to).filter(|at| (c.start - region + at) % 32 == 4 * c.class) {
                                 // (The next fetch may have brought more.)
-                                assert!(dword(c.start - region + at).load(Ordering::Relaxed) >= value, "not landed");
+                                let got = dword(c.start - region + at).load(Ordering::Relaxed);
+                                assert!(
+                                    got >= value,
+                                    "not landed: expected at least {value} at offset {at:#x} (class {}), found {got}",
+                                    c.class
+                                );
                             }
                         }
                         let done: Vec<_> = ranges.iter().map(|&(a, b)| (c.start + a, c.start + b)).collect();
