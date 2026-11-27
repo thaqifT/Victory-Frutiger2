@@ -1297,18 +1297,36 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
+    // The slices first: a range whose source is not all mapped is refused
+    // before anything is unmapped, so a call that fails changes nothing.
+    let mut slices: Vec<Slice> = Vec::new();
+    if from != 0 {
+        slices.reserve(len.div_ceil(PAGE));
+        for k in (0..len).step_by(PAGE) {
+            let Some(slice) = physical.slice_at(from + k) else {
+                return false;
+            };
+            slices.push(slice);
+        }
+    }
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical.slice_at(at) else {
+    // One view per run of consecutive slices of one section, as
+    // `XMemMapPhysicalPages` maps them: a pool range of 256 pages used to be
+    // 256 `MapViewOfFile3` calls, each a system call under the address
+    // space's lock, and the title's page mappings waited behind them (run
+    // tl2: 64 ms of a streaming frame in `CopyPageMappingsBatchX` alone).
+    let mut i = 0;
+    while i < slices.len() {
+        let first = &slices[i];
+        let run = 1 + slices[i + 1..]
+            .iter()
+            .zip(1..)
+            .take_while(|(slice, k)| Arc::ptr_eq(&slice.section, &first.section) && slice.index == first.index + k)
+            .count();
+        if !map(&mut physical, to + i * PAGE, run * PAGE, first.clone()) {
             return false;
-        };
-        if !map(&mut physical, to + k, PAGE, slice) {
-            return false;
         }
+        i += run;
     }
     true
 }
