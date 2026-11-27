@@ -108,6 +108,8 @@ window, and closed on evidence. They are written down so nobody re-tests them.
 | the refusal fallback, before `VICTORY_WATCH_HEAP` | 516 guard walks a frame over 8,948.9 MB, 16.36 ms, to find 60 MB changed |
 | `VICTORY_SYNC_FINE` | inside the noise: +3.0 % one window, −5.7 % the next |
 | card-buffer pair `MIN_KB=64` / `MB=1536` | loses badly, 217.7 ms against 123.7; mapping causes explode |
+| `VICTORY_CARD_BUFFERS_MIN_KB=64` | neutral: 141.7 ms against 144.1 at matched draws, for 1,129 MB of card memory and 15,661 pieces compared |
+| card-buffer floor 4 MiB -> 1 MiB on 16 GB cards | **a win, and now the default**: CPU compare 80.3 -> 30.2 MB, copy-back 43.4 -> 24.7 ms a frame, for 91 MB more card memory out of 2,048 |
 | `VICTORY_LATE_*` | removes the device within 40–110 s with every knob off |
 
 Two fixes that **did** land and are proven:

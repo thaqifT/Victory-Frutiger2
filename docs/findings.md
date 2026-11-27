@@ -110,3 +110,32 @@ each commit naming its source. In short:
 - Belobug: pipeline workers for screen passes, the ambient stand-in's idea, pipeline and
   constant buffer bookkeeping (romainhedouin).
 - ZJOU: render targets not set again; some shader corrections are being looked at.
+
+## The card-buffer floor, and what it cost
+
+A title buffer's copy has two ways to be watched: on the card, in a compute pass of ours
+that compares the declared ranges by 64 KiB piece, or on the CPU, by snapshotting and
+comparing 80 MB a frame. Which one a copy takes is a size threshold,
+`VICTORY_CARD_BUFFERS_MIN_MB`. On a 16 GB card it was 4 MiB, and that floor was
+leaving every copy between 1 and 4 MiB on the CPU.
+
+At 1 MiB, on an RX 6800 (`cb1` -> `cb3`, 210 s, one variable, 0 errors, 0 removals):
+
+| counter | 4 MiB floor | 1 MiB floor |
+|---|---|---|
+| CPU compare, title buffers' copies | 80.3 MB / 396 ranges | 30.2 MB / 342 ranges |
+| of that, in copies >= 1 MiB | 46.5 MB | 0.0 MB |
+| copies, preparing | 22.8 ms / 99.5 MB | 19.2 ms / 65.9 MB |
+| copy-back | 43.4 ms / 38.6 MB | 24.7 ms / 21.2 MB |
+| card buffers alive | 1,001-1,004 MB | 1,087-1,095 MB |
+
+18.7 ms off the frame for 91 MB more card memory out of a 2,048 MB cap, so the tier
+now defaults to `(1, 2048)`. Going further down is not the move: `MIN_KB=64` puts 3,485
+copies and 1,129 MB on the card and 15,661 pieces through the compare pass, and the
+frame does not move (141.7 ms against 144.1 at matched draws).
+
+The 43.4 ms of copy-back was never the compare or the fetch wait. The compare is about
+6 ms spread over the copy threads and the card fetch wait is 4.0 ms; the rest is the
+read of title memory, the merge and the put back, which `card_back` already joins into
+one copy list, one signal, one wait. `VICTORY_TIMELINE` cannot measure them here: the
+recording stalls every hooked call, 2,758 ms a frame against 197.

@@ -172,7 +172,12 @@ pub(crate) fn cards() -> bool {
 /// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
 ///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
-///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
+///   ~13.5–15.2 GiB): `(1, 2048)` MiB. The 4 MiB floor this tier had sent
+///   only the largest copies to the card, so every buffer between 1 and 4 MiB
+///   was still compared on the CPU and copied back through the bus: on an
+///   RX 6800 that was 50 MB of the 80 MB compared and 19 ms of the 43 ms of
+///   copy-back a frame (`cb1` -> `cb3`), for 91 MB more card memory out of
+///   2048.
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
 ///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
 ///   still leave headroom for textures and render targets.
@@ -186,7 +191,7 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     if budget_mb <= TWELVE_GIB_MB {
         (16, 512)
     } else if budget_mb < TWENTY_GIB_MB {
-        (4, 2048)
+        (1, 2048)
     } else {
         (1, (budget_mb / 4).min(8192))
     }
@@ -212,7 +217,7 @@ fn resolve_card_limits(
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
 /// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
-/// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
+/// `<= 12 GiB` budgets, 1 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
@@ -5845,10 +5850,13 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
-        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
-        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
-        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
-        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
+        // 1 MiB min: the 4 MiB floor left every copy between 1 and 4 MiB on the
+        // CPU (`cb3` on an RX 6800: 50 MB of 80 MB compared, 19 ms of 43 ms of
+        // copy-back a frame, for 91 MB more card memory out of 2048).
+        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (1, 2048));
 
         // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
         assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
