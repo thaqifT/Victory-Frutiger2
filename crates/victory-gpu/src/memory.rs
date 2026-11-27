@@ -610,6 +610,14 @@ impl Memory {
         self.stats.packed += 1;
     }
 
+    /// Whether a page placed at submission remembers its write-watch stamp.
+    /// `VICTORY_PLACE_TAKEN=0` keeps the old refresh behaviour, for comparison
+    /// (fxeless #1496).
+    fn place_taken() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_PLACE_TAKEN").is_none_or(|v| v != "0"))
+    }
+
     /// A place in an arena for a page of committed title memory, at a
     /// submission: only one there is already (the list brings up the arenas
     /// it knew when it was recorded).
@@ -626,7 +634,22 @@ impl Memory {
         };
         self.hold(page, at, copy);
         crate::watch::wrote(self.entry(page) as usize, 8);
+        // Remember the asking before the initial upload. Otherwise the next
+        // refresh treats this page as never taken and sends the title's bytes
+        // over structures the builder has already changed on the card
+        // (fxeless #1496, ported).
+        let now = if Self::place_taken() {
+            crate::watch::writes(page as usize * PAGE as usize, (page as usize + 1) * PAGE as usize, true)
+                .map(|(now, _)| now)
+        } else {
+            None
+        };
         self.take(page, 0, PAGE as usize, true);
+        if let Some(now) = now {
+            if let Some(held) = self.pages.get_mut(&page) {
+                held.taken = now.max(1);
+            }
+        }
         true
     }
 
@@ -1276,6 +1299,52 @@ mod dump {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page copied at submission is already current. Its first refresh
+    /// must not schedule a whole-page upload over the builder's card writes;
+    /// a later title write still has to reach the copy (fxeless #1496).
+    #[test]
+    fn a_placed_page_is_not_taken_again_until_the_title_writes() {
+        struct Title(usize);
+        impl Drop for Title {
+            fn drop(&mut self) {
+                // SAFETY: this test owns the allocation from `reserve`.
+                unsafe {
+                    windows_sys::Win32::System::Memory::VirtualFree(
+                        self.0 as *mut _,
+                        0,
+                        windows_sys::Win32::System::Memory::MEM_RELEASE,
+                    );
+                }
+            }
+        }
+        let title = Title(crate::upload::reserve(PAGE as usize).expect("a watched title page"));
+        // SAFETY: a committed, page-aligned allocation owned by this test.
+        unsafe { (title.0 as *mut u32).write(7) };
+        let Some(mut memory) = Memory::new() else {
+            eprintln!("placed-page test skipped: host memory-by-address resources unavailable");
+            return;
+        };
+        assert!(memory.another(), "an arena for the placed page");
+        memory.frame = 1;
+        let page = title.0 as u64 / PAGE;
+        assert!(memory.place(page));
+        let at = memory.pages[&page].at;
+        // SAFETY: the page's mapped staging copy, owned by `memory`.
+        assert_eq!(unsafe { (at as *const u32).read() }, 7);
+
+        memory.frame += 1;
+        memory.bring(page, page + 1);
+        assert_eq!(memory.stats.changed, 0, "an unchanged placed page must not be uploaded again");
+
+        // SAFETY: the title's still-live write-watched allocation.
+        unsafe { (title.0 as *mut u32).write(19) };
+        memory.frame += 1;
+        memory.bring(page, page + 1);
+        assert_eq!(memory.stats.changed, 4, "only the title's changed dword is taken");
+        // SAFETY: the same mapped staging copy as above.
+        assert_eq!(unsafe { (at as *const u32).read() }, 19);
+    }
 
     #[test]
     fn a_piece_takes_what_changed() {

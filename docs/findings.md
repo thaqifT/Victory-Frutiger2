@@ -864,3 +864,62 @@ been found.** `VICTORY_GPU_TIMING` (needs `VICTORY_D3D12_DRED=full`) names six
 compute dispatches at 25.9 ms between them; they are single dispatches in the
 title's own shaders. The only remaining structural win is overlapping the
 77.4 with the 31.0 -- the relay -- and that is the wedge in the section above.
+### The write-combining skip strobes the screen: `wc3` against `wc4`
+
+`313f0e9f` shipped `VICTORY_SKIP_WC_BACK` on by default on the strength of a
+time measurement alone. `wc4` is the controlled run that says that was wrong.
+
+**The warning.** `wc3` (skip on) logged **529** `a black frame after a frame
+that was not`, alternating in pairs from frame 2068 on:
+
+```
+frame=2108 resource=0x2177b250d70 state=0x4 draws=1069 copied=true
+  black_frames=24 levels=[130, 1, 129, 1, 130, 1, 129, 1, 129, 2, 128, 1]
+```
+
+Same resource every time, `state=0x4`, `copied=true`, gap median 2. The probe
+(`capture::probe` -> `capture::black`) reads the texture that is being
+presented, so this is not a dark scene: the presented frame itself alternates.
+
+**The controlled run.** `wc4` is `wc3` with one thing changed --
+`-More 'VICTORY_SKIP_WC_BACK=0'` -- and the same wrapper, tag shape and
+`-Seconds 260 -Press 28,40,60,80,100,120`:
+
+| run | skip | max frame reached | black-frame warnings |
+|---|---|---|---|
+| `wc4` | off | 2932 | **3** |
+| `wc3` | on | 3152 | **529** |
+
+`wc4` reached frame 2932, past the whole of `wc3`'s alternation window
+(2068-3152), and logged only the three warnings every run logs in its first
+frames. Across the ~150 logs on this machine the count is 0 to 14. And
+`looks\wc4\150.png` renders correctly -- a cutscene frame, subtitles legible.
+
+**What it costs to be correct.** `copying back` on the frame line:
+
+| run | skip | copying back |
+|---|---|---|
+| `wc2`, world frames only | off | 21.36 ms / 23.41 MB |
+| `wc2`, world frames only | on | 5.08 ms / 1.58 MB |
+| `wc4`, a heavy frame | off | 36.5 ms / 36.5 MB |
+| `wc3`, a heavy frame | on | 4.9 ms / 1.0 MB |
+
+So 16 to 32 ms a frame is real, and it is still the wrong trade.
+
+**Why.** `wc.rs`'s own module header names the artifact: "Where the title's CPU
+writes part of a 64 KiB piece the card also wrote, the next upload sends the
+card's stale bytes there". Leaving the piece on the card makes that happen for
+*every* piece a shader wrote, not just the ones the title later touches. When
+the title reads a buffer it fills with compute and hands back to the card, it
+reads a frame behind. A frame that alternates black and bright is one of two
+buffers being stale.
+
+**The way back** is `7b606552`: default off, `VICTORY_SKIP_WC_BACK=1` still buys
+the time for anyone who wants it. A real fix would need to know that the
+title's CPU never reads a piece, and there is no such signal today.
+
+**What this cost the session** is worth recording too. `wc2`'s A/B looked clean
+because `wc2` never reached the scene -- max 5502 draws against `wc3`'s 8277 --
+and because the warning count for the whole run was 6, which reads like the
+startup noise every log has. The lesson is not "measure"; it is **count the
+warnings, not only the milliseconds, and make sure the run reaches the scene**.

@@ -201,8 +201,8 @@ pub(crate) fn known() -> usize {
 
 /// What the experiment is set to, said once, so a log can be read without
 /// knowing which switches were passed. Only the further half says anything:
-/// leaving write-combining pieces on the card is the default now, and a run
-/// that wants them back says `VICTORY_SKIP_WC_BACK=0`.
+/// leaving write-combining pieces on the card is off by default, and a run
+/// that wants them left there says `VICTORY_SKIP_WC_BACK=1`.
 pub(crate) fn announce() {
     if !skip_compare() {
         return;
