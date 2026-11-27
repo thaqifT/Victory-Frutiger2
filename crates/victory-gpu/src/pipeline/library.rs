@@ -107,9 +107,18 @@ struct Mapped {
 }
 
 impl Mapped {
+    /// Bytes of zeroes mapped after a library's own: the host's compiler
+    /// reads a little past the end of what it is given. `amdxc64.dll` read
+    /// two bytes past the end of an exactly page-sized library on an RX 6800
+    /// (`amdxc64+0x176cd5`, `r13 = 0x...3ffe`, read at `0x...4000`: nothing
+    /// mapped there), which ended the boot about half the time -- the half
+    /// whose library file happened to land on a page. A view that ends with
+    /// the file has nothing mapped past it; four pages of slack always do.
+    const SLACK: usize = 0x4000;
+
     /// Maps `file` (`len` bytes, not zero) for reading, or for reading and
-    /// writing.
-    fn map(file: &std::fs::File, len: usize, write: bool) -> Option<Mapped> {
+    /// writing. `slack`: map [`Mapped::SLACK`] bytes of zeroes after it too.
+    fn map(file: &std::fs::File, len: usize, write: bool, slack: usize) -> Option<Mapped> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
@@ -118,6 +127,9 @@ impl Mapped {
         if len == 0 {
             return None;
         }
+        // A writable mapping larger than the file would grow the file.
+        let slack = if write { 0 } else { slack };
+        let view = len.checked_add(slack)?;
         // SAFETY: a file we hold open; the view keeps the file's pages
         // after the mapping object and the file are closed.
         let at = unsafe {
@@ -125,14 +137,14 @@ impl Mapped {
                 file.as_raw_handle(),
                 std::ptr::null(),
                 if write { PAGE_READWRITE } else { PAGE_READONLY },
-                0,
-                0,
+                (view >> 32) as u32,
+                view as u32,
                 std::ptr::null(),
             );
             if mapping.is_null() {
                 return None;
             }
-            let at = MapViewOfFile(mapping, if write { FILE_MAP_WRITE } else { FILE_MAP_READ }, 0, 0, 0);
+            let at = MapViewOfFile(mapping, if write { FILE_MAP_WRITE } else { FILE_MAP_READ }, 0, 0, view);
             CloseHandle(mapping);
             at
         };
@@ -153,7 +165,7 @@ impl Mapped {
         // renames the new library over this one.
         let file = std::fs::File::open(path).ok()?;
         let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
-        let mut mapped = Mapped::map(&file, len, false)?;
+        let mut mapped = Mapped::map(&file, len, false, Mapped::SLACK)?;
         if hold {
             mapped._file = Some(file);
         }
@@ -171,7 +183,7 @@ impl Mapped {
             .open(path)
             .ok()?;
         file.set_len(len as u64).ok()?;
-        Mapped::map(&file, len, true)
+        Mapped::map(&file, len, true, 0)
     }
 
     fn bytes(&self) -> &[u8] {
