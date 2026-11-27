@@ -3311,8 +3311,32 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
     }
+    if merge_under() {
+        // The same merge without `late`: the flights are in the air anyway,
+        // but here they are settled at the end of the frame, so the merge
+        // only has to keep the refresh from going a submission late. What it
+        // saves is the settle in the middle of the frame -- "title memory
+        // changed under shader writes" was 16.5 ms of a 152.6 ms frame in
+        // lt1, and 226 ms of a 900 ms one. It is off by default because a
+        // byte both the title and a flight's shader write is then the
+        // title's if the shader wrote it first, which is a race the title
+        // does not have on the console.
+        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        return spans;
+    }
     spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
     spans
+}
+
+/// `VICTORY_MERGE_UNDER=1`: the title's bytes that land in a range a flight's
+/// shaders may write are merged into the copy ([`stale_under_flights`]) rather
+/// than the flights being settled first, without any of the rest of `late`.
+/// Off by default.
+fn merge_under() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_UNDER").is_some_and(|v| v == "1"))
 }
 
 /// How many parts of submissions, and lists, the line's thread gives to the
@@ -5623,6 +5647,19 @@ impl Host {
             if flights > 0 {
                 submitting(2, flights);
                 let waiting = std::time::Instant::now();
+                trail(|| {
+                    let lists: usize = items
+                        .iter()
+                        .filter_map(|i| match i {
+                            Late::Run(f) => Some(f.order.len()),
+                            _ => None,
+                        })
+                        .sum();
+                    format!(
+                        "settling: waiting for the card on {} submissions of {lists} lists, fence at {}",
+                        flights, *submitted
+                    )
+                });
                 // SAFETY: the fence and event are ours, under the
                 // submission lock; `submitted` is the last value signalled.
                 unsafe {
@@ -6040,6 +6077,27 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            // The cuts are what a device removal has to name: `late` sends a
+            // frame's lists as one submission but the queue takes them in
+            // pieces, and a removal "internally" names no command at all.
+            trail(|| {
+                let mut shape = String::new();
+                let mut from = 0;
+                for to in cuts.iter().copied().chain([lists.len()]) {
+                    use std::fmt::Write as _;
+                    if !shape.is_empty() {
+                        shape.push_str(", ");
+                    }
+                    let _ = write!(shape, "{}", to - from);
+                    from = to;
+                }
+                format!(
+                    "submission {} sent ahead: {} lists in cuts [{shape}], {} on the card before it",
+                    *submitted,
+                    lists.len(),
+                    *submitted - 1
+                )
+            });
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let mut from = 0;
