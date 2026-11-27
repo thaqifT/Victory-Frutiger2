@@ -9757,7 +9757,7 @@ impl Meter {
                      dropped {dropped:.0} without a host pipeline ({making} being made) and \
                      {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                      textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                     {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                     {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}, write-combining skip {wc}",
                     picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                     picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                     picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
@@ -9777,7 +9777,8 @@ impl Meter {
                     ),
                     making = crate::pipeline::making(),
                     placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
-                    objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
+                    objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed),
+                    wc = if crate::wc::skip_back() { "on" } else { "off" }
                 );
                 #[cfg(feature = "diagnostics")]
                 {
@@ -9794,19 +9795,27 @@ impl Meter {
                     {
                         // `crate::wc` (fxeless #868): pieces of write-combining
                         // title memory left on the card rather than read back.
+                        // Said once as soon as the title's reservations are
+                        // known, so a run with no skips still shows that the
+                        // map was built, and after that only when one is left.
                         let (pieces, bytes) = crate::wc::skipped();
+                        let known = crate::wc::known();
                         static LAST: [std::sync::atomic::AtomicU64; 2] =
                             [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+                        static SAID: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        let first = known > 0 && !SAID.swap(true, Ordering::Relaxed);
                         let was = LAST[0].swap(pieces, Ordering::Relaxed);
                         let was_bytes = LAST[1].swap(bytes, Ordering::Relaxed);
-                        if pieces > was {
+                        if pieces > was || first {
                             tracing::info!(
                                 "write-combining pieces left on the card per frame (VICTORY_SKIP_WC_BACK): {:.1} pieces, {:.1} MB not read back; {} MB in all, of {} reservations",
                                 (pieces - was) as f64 / frames,
                                 (bytes - was_bytes) as f64 / frames / 1e6,
                                 bytes >> 20,
-                                crate::wc::known()
-                            );                        }
+                                known
+                            );
+                        }
                     }
                     for (why, n) in drops.iter().take(40) {
                         tracing::info!(

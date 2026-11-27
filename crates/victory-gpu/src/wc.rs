@@ -66,9 +66,11 @@ pub(crate) fn skip_compare() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_WC_COMPARE").is_some_and(|v| v == "1"))
 }
 
-/// Whether anything here matters at all: the reservations are only recorded
-/// when one of the switches is on, so a run without them pays one relaxed
-/// load per reservation and nothing else.
+/// Whether a skip is to happen now, which is what the switches decide. The
+/// reservations themselves are recorded whatever this says: the title asks for
+/// its 3.8 GB once, at start-up, long before an `VICTORY_AB` phase could turn
+/// anything on -- a map built only while a switch was on stayed empty for a
+/// whole run (`wc1`).
 fn on() -> bool {
     skip_back() || skip_compare()
 }
@@ -86,7 +88,7 @@ static RESERVATIONS: Mutex<BTreeMap<usize, Reservation>> = Mutex::new(BTreeMap::
 /// `protect` (the console's, before the runtime cleaned it). Only reservations
 /// with a bit this file cares about are kept: the map is looked up per piece.
 pub fn title_memory_reserved(at: usize, len: usize, protect: u32) {
-    if !on() || at == 0 || len == 0 {
+    if at == 0 || len == 0 {
         return;
     }
     announce();
@@ -104,7 +106,7 @@ pub fn title_memory_reserved(at: usize, len: usize, protect: u32) {
 /// The runtime freed the reservation at `at` (`XMemVirtualFree`), or part of
 /// it from `at` on.
 pub fn title_memory_released(at: usize) {
-    if !on() || at == 0 {
+    if at == 0 {
         return;
     }
     let mut reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
@@ -173,9 +175,6 @@ pub(crate) fn skipped() -> (u64, u64) {
 
 /// How many reservations are known, for the log line at start-up.
 pub(crate) fn known() -> usize {
-    if !on() {
-        return 0;
-    }
     RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).len()
 }
 
