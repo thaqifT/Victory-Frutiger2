@@ -2940,6 +2940,28 @@ fn flying() -> bool {
     line.settling || line.line.iter().any(|l| matches!(l, Late::Run(_)))
 }
 
+/// Whether a shadow copy's refresh must wait for the flights in the air
+/// ([`late`]): their shaders are reading those copies right now.
+///
+/// Every other thing done between sending a submission and waiting for it is
+/// already guarded — [`late_blocked`] stops preparing a list whose memory a
+/// flight writes. The refresh was not, and it is the one that rewrites memory
+/// a running command is reading: `Shadow::update` copies the title's bytes
+/// into the shadow copy the card was handed. Rewriting it mid-flight is a
+/// command that was well formed when it was sent and whose input changed
+/// underneath it, which the driver reports as `DXGI_ERROR_DEVICE_RESET`
+/// (`0x887A0007`) with **no** debug-layer error and **no** breadcrumbs — which
+/// is exactly what every `late` run has produced.
+///
+/// `VICTORY_LATE_HOLD=0` refreshes anyway, for the A/B.
+pub(crate) fn hold_refresh() -> bool {
+    if !flying() {
+        return false;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_HOLD").is_none_or(|v| v != "0"))
+}
+
 /// With flights in the air ([`late`]): why `runs` cannot be prepared
 /// before they are settled, if so. Preparing reads title memory on the
 /// CPU (the title's buffer copies, fills of upload memory, textures) and

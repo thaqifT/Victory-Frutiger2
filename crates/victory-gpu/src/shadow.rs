@@ -3972,6 +3972,17 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        // Flights in the air are reading these copies right now (`late`):
+        // rewriting them under a command that is already running is a
+        // DXGI_ERROR_DEVICE_RESET with no debug-layer error and no
+        // breadcrumbs (`host::hold_refresh`). The copy keeps the bytes the
+        // flights were handed; the next refresh after they settle brings it
+        // up to date.
+        if crate::host::hold_refresh() {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::HeldRefresh, len as u64);
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
