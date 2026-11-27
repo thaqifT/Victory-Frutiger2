@@ -131,10 +131,11 @@ pub(crate) enum C {
     NothingBack,
     NothingBackUs,
     /// Waits for every earlier shader write recorded into host lists: for
-    /// the title's barrier groups, for its barriers on buffers, and the
-    /// indirect commands bounded (each a dispatch of ours between two such
-    /// waits).
+    /// the title's barrier groups, for its pipeline syncs, for its barriers
+    /// on buffers, and the indirect commands bounded (each a dispatch of
+    /// ours between two such waits).
     WaitsForGroups,
+    WaitsForSync,
     WaitsForBuffers,
     IndirectBounded,
 }
@@ -388,15 +389,29 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
 /// Whether an experiment on barriers is on (`VICTORY_BARRIER_TEST`): bit 0
 /// for `groups` (the title's barrier groups record no wait for earlier
 /// shader writes), bit 1 for `indirect` (the pass that bounds an indirect
-/// command runs without its two such waits; its state changes stay), both
-/// bits for `both`. For timing only: without the waits a shader may read
-/// what another has not finished writing.
+/// command runs without its two such waits; its state changes stay), bit 2
+/// for `sync` (its pipeline syncs record no such wait), `all` for the three.
+/// For timing only: without the waits a shader may read what another has not
+/// finished writing.
+///
+/// Named in `VICTORY_AB`, it is the whole experiment on and off, phase by
+/// phase, in one run and one scene -- the only way to compare frame times
+/// here (the draw count swings 400 to 7,900 inside a run).
 pub(crate) fn barrier_test() -> u8 {
+    #[cfg(feature = "diagnostics")]
+    {
+        static AB: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(bit) = *AB.get_or_init(|| crate::ab::bit("VICTORY_BARRIER_TEST")) {
+            return if crate::ab::on(bit) { 7 } else { 0 };
+        }
+    }
     static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
         Ok("groups") => 1,
         Ok("indirect") => 2,
         Ok("both") => 3,
+        Ok("sync") => 4,
+        Ok("all") => 7,
         _ => 0,
     })
 }
@@ -1581,9 +1596,10 @@ pub(crate) fn log(frames: f64) {
     }
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
-         for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         for its pipeline syncs, {:.0} for its barriers on buffers; {:.0} indirect commands bounded (a \
+         dispatch of ours between two such waits each); barrier experiment {}",
         c[C::WaitsForGroups as usize],
+        c[C::WaitsForSync as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         barrier_test()

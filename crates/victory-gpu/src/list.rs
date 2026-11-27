@@ -1580,7 +1580,10 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                         "a pipeline sync"
                     );
                 }
-                crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+                crate::copystat::add(crate::copystat::C::WaitsForSync, 1);
+                if crate::copystat::barrier_test() & 4 != 0 {
+                    return;
+                }
             }
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
