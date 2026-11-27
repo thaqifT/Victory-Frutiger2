@@ -56,6 +56,17 @@ pub(crate) fn on() -> bool {
 /// no refresh sends title memory over it while a flight may write it, and
 /// not landed), 2 (landed too).
 fn stage() -> u8 {
+    // Under `VICTORY_AB` the switch is on (2) and off (0) while the title
+    // runs, so both sides are measured in one scene: the frame times of a
+    // cross-run comparison are not comparable, because a slower run has got
+    // less far into the world by the same second.
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: OnceLock<Option<u32>> = OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_PICKED_WRITES")) {
+            return if crate::ab::on(bit) { 2 } else { 0 };
+        }
+    }
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| match std::env::var("VICTORY_PICKED_WRITES").as_deref() {
         Ok("1") => 1,
