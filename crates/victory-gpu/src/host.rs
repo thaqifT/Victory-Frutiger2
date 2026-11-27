@@ -3880,10 +3880,6 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
-    crate::port::log(frames);
-    crate::port_cbv::log(frames);
-    crate::watch::port_guard_line(frames);
-    crate::port_journal::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -9409,6 +9405,15 @@ impl Meter {
             crate::shadow::exact_line(frames);
             crate::descriptor::sync_line(frames);
             late_line(frames);
+            // The renderer ports' counters, printed whether or not `late` is
+            // on: each of these returns at once unless its switch is on (or,
+            // under `VICTORY_AB`, the current phase has it). They used to sit
+            // inside `late_line`, which returns at once without `late`, so a
+            // port could never be read on a run that stayed up.
+            crate::port::log(frames);
+            crate::port_cbv::log(frames);
+            crate::watch::port_guard_line(frames);
+            crate::port_journal::line(frames);
             crate::queue::behind_line(frames);
             card_clock_line(frames, ms);
             upq::line(frames);
