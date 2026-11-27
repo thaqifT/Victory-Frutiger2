@@ -5337,11 +5337,19 @@ impl Host {
         let mut total = 0u64;
         plan.picked_found(differs);
         for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked) {
+            let start = r.shadow.span().0 as usize;
             for p in 0..r.span.pieces {
                 if r.compared && !torn::flagged(differs[(r.at + p) as usize]) {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                // A piece of write-combining title memory stays on the card
+                // (`crate::wc`, fxeless #868): not fetched, not waited for,
+                // not merged -- and `card_merge`'s read of title memory,
+                // which is the expensive half, never happens for it.
+                if lo < hi && crate::wc::skip_piece(start + lo, hi - lo) {
+                    continue;
+                }
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;

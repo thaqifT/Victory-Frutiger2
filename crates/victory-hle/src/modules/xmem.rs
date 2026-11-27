@@ -189,7 +189,7 @@ pub extern "system" fn XMemVirtualAlloc(
     note_protection(asked, kind, flags, at as usize, size);
     // What the title asked for, before the runtime cleaned it: the
     // write-combining bit is what `victory_gpu::wc` decides on (#868).
-    if !at.is_null() && kind & MEM_COMMIT == 0 {
+    if !at.is_null() {
         victory_gpu::title_memory_reserved(at as usize, size, asked);
     }
     at

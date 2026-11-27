@@ -91,7 +91,14 @@ pub fn title_memory_reserved(at: usize, len: usize, protect: u32) {
     }
     announce();
     let mut reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
-    reservations.insert(at, Reservation { len, protect });
+    // The widest entry for a base wins: a later commit of part of a
+    // placeholder must not narrow what the reservation covered.
+    match reservations.get(&at) {
+        Some(had) if had.len >= len => {}
+        _ => {
+            reservations.insert(at, Reservation { len, protect });
+        }
+    }
 }
 
 /// The runtime freed the reservation at `at` (`XMemVirtualFree`), or part of

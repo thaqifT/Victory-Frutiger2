@@ -4766,6 +4766,11 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
+        // A piece of write-combining title memory stays on the card
+        // (`crate::wc`, fxeless #868): nothing of it goes back.
+        if crate::wc::skip_piece(start + at, gpu.len()) {
+            return 0;
+        }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
