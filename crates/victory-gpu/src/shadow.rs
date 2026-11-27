@@ -1632,6 +1632,19 @@ const WIDE_JOB: usize = 1 << 20;
 /// (from, to, bytes), taken by [`take_snapshots`].
 static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 
+/// Since the last frame line: calls of [`Shadow::nothing_new`], the
+/// nanoseconds they took on all threads, and the bytes of those that said
+/// nothing was new. What a flush of refreshes costs is these against the
+/// copies `Shadow::update` makes.
+#[cfg(feature = "diagnostics")]
+static CHECKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`CHECKED`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn check_stats() -> [u64; 3] {
+    std::array::from_fn(|i| CHECKED[i].swap(0, Ordering::Relaxed))
+}
+
 /// With [`wide_back`], when a submission's refreshes are done and before
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
 /// Nothing to do without the switch.
@@ -4064,6 +4077,22 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
+        let same = self.nothing_new_at(address, len);
+        #[cfg(feature = "diagnostics")]
+        {
+            CHECKED[0].fetch_add(1, Ordering::Relaxed);
+            CHECKED[1].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if same {
+                CHECKED[2].fetch_add(len as u64, Ordering::Relaxed);
+            }
+        }
+        same
+    }
+
+    /// [`Shadow::nothing_new`], as it is: the caller counts what it cost.
+    fn nothing_new_at(&self, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
         }
