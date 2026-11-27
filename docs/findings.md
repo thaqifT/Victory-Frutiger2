@@ -138,3 +138,75 @@ The 43.4 ms of copy-back was never the compare or the fetch wait. The compare is
 read of title memory, the merge and the put back, which `card_back` already joins into
 one copy list, one signal, one wait. `VICTORY_TIMELINE` cannot measure them here: the
 recording stalls every hooked call, 2,758 ms a frame against 197.
+
+## The card's time, named by command
+
+`VICTORY_GPU_TIMING=1` alone names nothing: `HostList::note` returns at its
+`if !dred_on()` gate, so every note is empty and the by-list line reads
+`their noted commands 0.0, the rest 121.4`. `VICTORY_D3D12_DRED=full` is what
+fills them (`g2`, 210 s, 0 errors, 0 removals, peak 22,989 MB -- DRED full
+costs frame rate, so a timing run is not an fps run).
+
+At ~1,450 draws:
+
+```text
+the card's time by list (timing run), per frame: 124.6 ms in 298 lists
+  the title's 107.9 ms in 212 (their noted commands 78.7, the rest 29.3)
+  preludes 11.5 ms in 71 (refreshes of copies)
+  compares of copies in the card's memory 5.2 ms in 15
+  the least a list took 60 us (17.9 ms a frame at that for every list)
+```
+
+Averaged over the run's 1,136 by-command lines:
+
+| ms/frame | per frame | what |
+|---|---|---|
+| 5.60 | x1.0 | `compute 8bbcbda6008eaa37` |
+| 4.96 | x1.0 | `compute 919bafe017d59512` |
+| 4.76 | x1.0 | `compute 39f0e9aeb156a61c` |
+| 4.35 | x0.9 | `compute 915ed81ea580a276` |
+| 3.14 | x1.0 | `compute 776d835da5ffa646` |
+| 3.13 | x1.0 | `compute 6697dff15287e544` |
+| 3.00 | x140.6 | `vertex ea1100d0f8564245` |
+| 2.26 | x1.0 | `compute bc6ca78d5425c179` |
+| 2.13 | x71.3 | `alias copy` |
+| 2.10 | x1.0 | `compute bba90b2f0ff2eada` |
+
+Six compute passes, each dispatched once a frame, are 25.9 ms of the ~125.
+They are not many small things that could be batched; they are single fat
+dispatches at 4-6 ms each, the longest 16.6 ms. No rewrite of ours reaches
+into the title's own shaders, so this is a floor, not a lever.
+
+By kind over all 1,136 lines: `alias` 27 at 2.13 ms, `indirect` 398 at 0.90,
+`dispatch` 532 at 0.64, `draw` 131 at 0.61, `mesh` 13 at 0.40, `indexed` 33 at
+0.08, `copy` 2 at 0.01.
+
+The **29.3 ms "the rest"** of the title's lists -- barriers, what of ours is
+recorded among the title's commands, and the sending -- is the bigger item and
+is ours. `VICTORY_JOIN_BARRIERS=1` was the first way in and it does not
+survive the boot: the title's own Breakpad handler fires three seconds in
+while its first pipelines are still being made. Closed, off.
+
+## Where the preparing goes, split
+
+`rf2` (210 s, 0 errors, 0 removals, peak 20,425 MB -- the lowest of the
+session) instruments `Shadow::nothing_new` and settles what the refreshes
+cost. Over 103 preparing lines of 5,000-11,000 spans a frame:
+
+| per frame | |
+|---|---|
+| refreshes | 23.4 ms |
+| of which the checks | 7.6 ms |
+| of which the copies | 1.4 ms |
+| calls of `nothing_new` | ~6,224 |
+| bytes found clean | 5,912 MB |
+
+So the copies are almost nothing and the *check* is 7.6 ms -- 1.2 us a call,
+which is the page-record walk (`j.notes.each` over ~230 pages) and not the
+locks: the journal's own read waits are 134-156 waits and 1.2-3.8 ms a frame,
+measured separately. The remaining ~5.8 ms is the span build and the
+`wide_each` dispatch.
+
+`VICTORY_WIDE_SPIN=500` was measured against this (`rf1`) and is a wash:
+refreshes 20.2 -> 19.1 ms in the matched 95-180 s window, for four cores
+spinning. Stays 0.
