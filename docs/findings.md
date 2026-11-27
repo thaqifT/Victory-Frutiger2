@@ -655,3 +655,86 @@ Three of `fxceless/victory-fork`'s 946 open PRs were read against this tree.
 
 #868 is the one that carried a measurement, and it is now in the tree as
 `crate::wc`.
+### A shader write is not landed when the title writes a dword beside it
+
+`host::refresh_tests::landings_title_writes_and_light_refreshes_at_once` fails
+on this tree, deterministically, in the first few rounds. It was taken as
+"pre-existing and flaky" in earlier sessions. It is neither flaky nor benign.
+
+**Repro, 60 ms:**
+
+```powershell
+$env:VICTORY_TEST_ROUNDS='5'
+cargo test --manifest-path E:\GTA6_Frutiger\victory2\Cargo.toml --locked `
+  -p victory-gpu --features diagnostics `
+  landings_title_writes_and_light_refreshes_at_once
+# not landed: expected at least 6 at offset 0xc50c (class 3), found 4
+```
+
+`VICTORY_TEST_ROUNDS=1` and `=2` **pass**. `=5` and above fail. `=120` fails in
+the same place or in the second copy's class. So it is not a race that needs
+load -- it is state that two rounds build.
+
+**What the test sets up.** Two writer threads bump dwords at offset `% 32 == 4`
+and `== 8`. A flight's shaders write dwords at `% 32 == 12` (copy 0) and
+`== 20` (copy 1). The two sets are disjoint on purpose, and the test's own
+comment says so: whatever lands can never be overwritten by the title.
+
+**What is observed.** Copy 0's round-1 flight (value 4) lands. Its round-2
+flight (value 6) does not, and title memory still holds 4. The failure is at a
+`% 32 == 12` offset, which is a shader dword, so the title never wrote it.
+
+**Where it goes.** `Shadow::land_card` (`shadow.rs:4873`) builds a skip list
+from `card.dirty` and `card.sent` before landing, and lands only the parts of
+each piece outside it:
+
+```rust
+let mut skip: Vec<(usize, usize)> =
+    dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+sent.near(fetched_after, from, to, &mut skip);
+```
+
+`dirty` is "the title's bytes that are to go up"; skipping them is right, since
+the title's newer bytes must win over an older fetch. So the question is only
+how a shader's dword at `% 32 == 12` ever gets into that list.
+
+**What was ruled out.** The first guess was `card_changed_runs`
+(`shadow.rs:4507`) joining runs that touch (`from <= last.1 && to >= last.0`).
+It is not that. The join is a union of written bytes and cannot invent one:
+`(4, 12)` and `(12, 16)` merge to `(4, 16)`, which holds nothing nobody wrote.
+A writer at `% 32 == 8` cannot grow a run into the shader's `12`.
+
+The second guess was a stale `VICTORY_SEND_CHANGED` note. Also not it:
+`send_changed()` is on by default now, and the test's own `exact` flag reads the
+same switch, so `dword_runs(.., gap 0)` is what records the ranges.
+
+`land_echo()` (`shadow.rs:2086`) is `toggled!`, so it too is on by default,
+which means `take_landed` is the path for a page that is `known`, `landing` and
+not under `upcheck`.
+
+**Two live suspects, neither confirmed.**
+
+1. `Shadow::copy` (`shadow.rs:4424`) sends a whole 4 KiB page into `dirty`
+   when `whole = !known && card.before.is_none()`. That page then holds every
+   byte of it, including shader dwords that have not been landed yet, and
+   `land_card` skips all of them. It also pushes the title's stale bytes up.
+   It needs a page that is not yet `known`, which is a cold page -- and the
+   failure is on a page the test has written to for several rounds.
+2. `sent.near(fetched_after, ...)` filters by the fetch's send number, but
+   `dirty` does not: a range that has not gone up yet is skipped as if it had.
+
+**Why it does not crash the game.** The consequence is a stale dword in title
+memory where the title and a shader write the same 32 bytes. It is corruption,
+not a fault, and it is invisible unless something reads the stale word.
+
+**What would settle it, cheaply.** Run the test with the two suspects turned
+off, one at a time, and see which one makes it pass:
+
+```powershell
+$env:VICTORY_SEND_CHANGED='0'   # the whole-page road only
+$env:VICTORY_LAND_ECHO='0'      # no take_landed
+```
+
+Neither was run here. The test is a synthetic harness that mutates the card's
+side by hand, so a pass under either switch would say which mechanism the
+harness is exercising before it says anything about the game.

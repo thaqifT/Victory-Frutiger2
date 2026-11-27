@@ -9813,7 +9813,11 @@ impl Meter {
                         let was_bytes = LAST[1].swap(bytes, Ordering::Relaxed);
                         if pieces > was || first {
                             tracing::info!(
-                                "write-combining pieces left on the card per frame (VICTORY_SKIP_WC_BACK): {:.1} pieces, {:.1} MB not read back; {} MB in all, of {} reservations",
+                                // The bytes are the extent of the pieces left alone, not the
+                                // bytes a fetch would have sent: a piece is 64 KiB whole and
+                                // only its changed dwords would have gone back. Read the
+                                // pieces against the frame line's `copying back`.
+                                "write-combining pieces left on the card per frame (VICTORY_SKIP_WC_BACK): {:.1} pieces, {:.1} MB of their extents; {} MB in all, of {} reservations",
                                 (pieces - was) as f64 / frames,
                                 (bytes - was_bytes) as f64 / frames / 1e6,
                                 bytes >> 20,

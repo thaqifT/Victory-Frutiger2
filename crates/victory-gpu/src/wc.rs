@@ -35,8 +35,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The console's write-combining bit in a protection.
 const WRITE_COMBINING: u32 = 0x400;
 
-/// Whether the experiment is on: shader writes to write-combining title
-/// memory are not copied back. `VICTORY_SKIP_WC_BACK=1`.
+/// Whether shader writes to write-combining title memory are not copied back.
+/// On by default; `VICTORY_SKIP_WC_BACK=0` puts them back as before.
+///
+/// Measured in `wc2`, world frames only, by the switch state each frame line
+/// carries: `copying back` 21.36 ms / 23.41 MB with it off, 5.08 ms / 1.58 MB
+/// with it on -- 16.3 ms of every frame, and 93 % of the bytes.
 pub(crate) fn skip_back() -> bool {
     // Diagnostics: named in `VICTORY_AB`, it changes while the title runs.
     #[cfg(feature = "diagnostics")]
@@ -48,7 +52,7 @@ pub(crate) fn skip_back() -> bool {
         }
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_WC_BACK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_WC_BACK").is_none_or(|v| v != "0"))
 }
 
 /// Whether such a piece is also left out of the card's compare
@@ -179,24 +183,19 @@ pub(crate) fn known() -> usize {
 }
 
 /// What the experiment is set to, said once, so a log can be read without
-/// knowing which switches were passed.
+/// knowing which switches were passed. Only the further half says anything:
+/// leaving write-combining pieces on the card is the default now, and a run
+/// that wants them back says `VICTORY_SKIP_WC_BACK=0`.
 pub(crate) fn announce() {
-    if !on() {
+    if !skip_compare() {
         return;
     }
     static SAID: std::sync::Once = std::sync::Once::new();
     SAID.call_once(|| {
-        if skip_compare() {
-            tracing::warn!(
-                "VICTORY_SKIP_WC_COMPARE=1: write-combining pieces are neither compared on the card nor fetched back \
-                 (experiment; a device removal was reported once with it)"
-            );
-        } else {
-            tracing::warn!(
-                "VICTORY_SKIP_WC_BACK=1: what shaders wrote to write-combining title memory is not fetched back \
-                 (experiment; the title's CPU reads of those pieces are stale)"
-            );
-        }
+        tracing::warn!(
+            "VICTORY_SKIP_WC_COMPARE=1: write-combining pieces are neither compared on the card nor fetched back \
+             (a device removal was reported once with it on an RTX 5080)"
+        );
     });
 }
 
