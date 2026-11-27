@@ -54,9 +54,127 @@ fn parts_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
 }
 
+/// Pages a leaf of [`Written`] covers: 4096, a quarter of a GiB of title
+/// memory.
+const LEAF_BITS: u32 = 12;
+const LEAF_PAGES: usize = 1 << LEAF_BITS;
+/// The leaf's slots, a bit each.
+const LEAF_WORDS: usize = LEAF_PAGES / 64;
+
+/// A quarter of a GiB of pages' notes, dense.
+struct Leaf {
+    /// Per page of the leaf, the asking that last found it written (0:
+    /// never).
+    notes: [u64; LEAF_PAGES],
+    /// The notes that are set, a bit each: a leaf with a page or two in it
+    /// is walked by these, not by its 4096 slots.
+    set: [u64; LEAF_WORDS],
+}
+
+impl Leaf {
+    const fn new() -> Leaf {
+        Leaf { notes: [0; LEAF_PAGES], set: [0; LEAF_WORDS] }
+    }
+}
+
+/// Per page, the asking that last found it written (0: never), in dense
+/// leaves.
+///
+/// A world frame walks 149,000 of these notes a frame and checks 9.3 GB of
+/// pages, 99.4 % of them unchanged (`gd8`: `457 watches 23.73 ms, 9,315 MB
+/// checked, 9,255 MB unchanged`). As a `BTreeMap` that walk is a cache miss
+/// a node, ~159 ns a page. Nearly every page of a checked range has a note,
+/// so a leaf is read straight through instead: 32 KiB in order, and one
+/// lookup per 4096 pages rather than one per page.
+struct Written {
+    leaves: std::collections::HashMap<usize, Box<Leaf>, std::hash::BuildHasherDefault<PageHash>>,
+    /// The leaves that are there, in page order. Leaves are only ever added,
+    /// so a walk starts at the first of them in its range and goes on from
+    /// there -- a range of the whole address space costs the leaves there
+    /// are, not the space it spans.
+    order: Vec<usize>,
+}
+
+impl Written {
+    const fn new() -> Written {
+        Written { leaves: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()), order: Vec::new() }
+    }
+
+    /// The asking that last found `page` written (0: never).
+    #[cfg(test)]
+    fn get(&self, page: usize) -> u64 {
+        self.leaves.get(&(page >> LEAF_BITS)).map_or(0, |leaf| leaf.notes[page & (LEAF_PAGES - 1)])
+    }
+
+    /// Note `page` written by asking `now`; the asking that found it written
+    /// before (0: none). The note only goes up.
+    fn note(&mut self, page: usize, now: u64) -> u64 {
+        let at = page >> LEAF_BITS;
+        let fresh = !self.leaves.contains_key(&at);
+        let leaf = self.leaves.entry(at).or_insert_with(|| Box::new(Leaf::new()));
+        if fresh {
+            let place = self.order.partition_point(|&had| had < at);
+            self.order.insert(place, at);
+        }
+        let k = page & (LEAF_PAGES - 1);
+        let before = leaf.notes[k];
+        if now > before {
+            leaf.notes[k] = now;
+            leaf.set[k / 64] |= 1 << (k % 64);
+        }
+        before
+    }
+
+    /// The notes of pages `[first, last)` in page order, `each` of them
+    /// until it says no: whether it never did.
+    fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
+        if first >= last {
+            return true;
+        }
+        let (a, b) = (first >> LEAF_BITS, (last - 1) >> LEAF_BITS);
+        let start = self.order.partition_point(|&at| at < a);
+        for &at in &self.order[start..] {
+            if at > b {
+                break;
+            }
+            let leaf = &self.leaves[&at];
+            let from = if at == a { first & (LEAF_PAGES - 1) } else { 0 };
+            let to = if at == b { ((last - 1) & (LEAF_PAGES - 1)) + 1 } else { LEAF_PAGES };
+            let (w0, w1) = (from / 64, (to - 1) / 64);
+            for w in w0..=w1 {
+                let mut bits = leaf.set[w];
+                if w == w0 {
+                    bits &= u64::MAX << (from % 64);
+                }
+                if w == w1 {
+                    bits &= u64::MAX >> (63 - ((to - 1) % 64));
+                }
+                while bits != 0 {
+                    let k = w * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if !each((at << LEAF_BITS) | k, leaf.notes[k]) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// The notes of pages `[first, last)` in page order.
+    fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        let mut out = Vec::new();
+        self.each(first, last, |p, w| {
+            out.push((p, w));
+            true
+        });
+        out
+    }
+}
+
 impl Shard {
     const fn new() -> Shard {
-        Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
+        Shard { written: Written::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
     }
 
     /// Page `page` was found written by asking `now`: the parts in `parts`
@@ -67,8 +185,7 @@ impl Shard {
     /// (renderer port #7) another asking with a higher number may have
     /// noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        let before = self.written.get(&page).copied().unwrap_or(0);
-        self.written.insert(page, before.max(now));
+        let before = self.written.note(page, now);
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -132,7 +249,7 @@ struct Notes([RwLock<Shard>; SHARDS]);
 /// A part of [`Notes`].
 struct Shard {
     /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    written: Written,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -176,12 +293,12 @@ impl Notes {
         match pieces(first, last) {
             Some(pieces) => pieces.into_iter().all(|(from, to)| {
                 let s = self.read(shard_of(from));
-                s.written.range(from..to).all(|(&p, &w)| each(p, w))
+                s.written.each(from, to, &mut each)
             }),
             None => {
                 let mut all: Vec<(usize, u64)> = Vec::new();
                 for shard in 0..SHARDS {
-                    all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
+                    all.extend(self.read(shard).written.range(first, last));
                 }
                 all.sort_unstable();
                 all.into_iter().all(|(p, w)| each(p, w))
@@ -273,13 +390,13 @@ impl Held<'_> {
         match pieces(first, last) {
             Some(pieces) => pieces
                 .into_iter()
-                .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
+                .flat_map(|(from, to)| self.shard(from).written.range(from, to))
                 .collect(),
             None => {
                 let all = if self.write.is_empty() {
-                    self.read.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
+                    self.read.iter().flat_map(|s| s.written.range(first, last)).collect::<Vec<_>>()
                 } else {
-                    self.write.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
+                    self.write.iter().flat_map(|s| s.written.range(first, last)).collect::<Vec<_>>()
                 };
                 let mut all = all;
                 all.sort_unstable();
@@ -5917,7 +6034,7 @@ mod port7_tests {
         let mut s = Shard::new();
         assert_eq!(s.note(3, WHOLE, 9), 0);
         assert_eq!(s.note(3, 0b11, 5), 9);
-        assert_eq!(s.written[&3], 9);
+        assert_eq!(s.written.get(3), 9);
         assert_eq!(s.parts_since(3, 8), WHOLE, "all of it at 9");
         assert_eq!(s.note(3, 0b100, 12), 9);
         assert_eq!(s.parts_since(3, 9), 0b100);
@@ -5925,7 +6042,7 @@ mod port7_tests {
         assert_eq!(s.note(3, WHOLE, 10), 12);
         assert_eq!(s.parts_since(3, 10), 0b100);
         assert_eq!(s.parts_since(3, 9), WHOLE);
-        assert_eq!(s.written[&3], 12);
+        assert_eq!(s.written.get(3), 12);
     }
 
     /// Many threads note pages (holding their parts for writing, a number
