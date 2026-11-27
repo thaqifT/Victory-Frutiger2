@@ -6160,7 +6160,10 @@ impl Host {
             ));
         }
         submitting(3, runs.len());
-        stage.next("submit: copying back");
+        // Split into its parts: a timeline of the world's frames put 19 ms a
+        // frame in this one span (tl1, 30 frames, mean 204.6 ms), and the
+        // span held five different jobs.
+        stage.next("copying back: the card's copies");
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -6171,6 +6174,7 @@ impl Host {
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
+        stage.next("copying back: into title memory");
         let back = crate::picked::with(declared, &picked.written);
         hand_back(&back);
         if let Some(card) = card {
@@ -6190,6 +6194,7 @@ impl Host {
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        stage.next("copying back: read-backs");
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
@@ -6198,6 +6203,7 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        stage.next("copying back: the tail");
         self.log_messages();
         submitting(0, 0);
         #[cfg(feature = "diagnostics")]
