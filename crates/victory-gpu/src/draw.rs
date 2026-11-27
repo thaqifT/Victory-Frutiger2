@@ -203,7 +203,12 @@ fn bake_exact() -> bool {
 /// before).
 fn recheck_soon() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_none_or(|v| v != "0"))
+    let default_on = || *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_none_or(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_RECHECK_SOON").unwrap_or_else(default_on);
+    #[cfg(not(feature = "diagnostics"))]
+    let on = default_on();
+    on
 }
 
 /// Frames ahead the pass before a bake takes slots from that are due only
@@ -765,9 +770,18 @@ fn reupload_when_full() -> bool {
 
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
+///
+/// Measured within one run by `VICTORY_AB=<s>,VICTORY_HEAP_RECHECK`: an 8 GB
+/// laptop reports prepare 44 -> 29 ms and copies 12 -> 10 ms / 70 -> 55 MB a
+/// frame with the pass off, at no frame-rate cost while the card is the limit.
 fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
+    let default_on = || *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_HEAP_RECHECK").unwrap_or_else(default_on);
+    #[cfg(not(feature = "diagnostics"))]
+    let on = default_on();
+    on
 }
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.

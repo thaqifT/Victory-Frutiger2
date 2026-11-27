@@ -8617,10 +8617,24 @@ impl Batch {
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
-        const FEW: usize = 256;
+        //
+        // `VICTORY_REFRESH_WIDE=1` takes the threaded road from 16 spans
+        // instead of 256, so a frame's ~50 flushes of ~100 spans each decide
+        // on the threads beside. Measured in rf1: a wash (2.7 against 3.5
+        // microseconds a span at like spans), because what a flush costs is
+        // the guards' walk and the copies, not the decision. Off.
+        fn refresh_wide() -> bool {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let default_on = || *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_WIDE").is_some_and(|v| v != "0"));
+            #[cfg(feature = "diagnostics")]
+            let on = crate::ab::pick("VICTORY_REFRESH_WIDE").unwrap_or_else(default_on);
+            #[cfg(not(feature = "diagnostics"))]
+            let on = default_on();
+            on
+        }
         let mut spans = spans;
-        // (Renderer port #6: on the threads beside, whatever their number.)
-        let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
+        let few = if refresh_wide() { 16 } else { 256 };
+        let many = spans.len() > few || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
         if !many {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]
