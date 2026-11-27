@@ -1213,14 +1213,25 @@ pub extern "system" fn XMemMapPhysicalPages(
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
+        unmap(&mut physical, base, n * PAGE);
         return address;
     };
     let slices: Vec<Option<Slice>> = {
         let table = page_table();
         pages.iter().map(|page| table.pages.get(page).cloned()).collect()
     };
+    // Already showing exactly these slices: unmapping and mapping again
+    // would put back what is there, one `UnmapViewOfFile2` and one
+    // `MapViewOfFile3` per view, each taking the address space's lock. The
+    // title maps the same pages again and again while it streams.
+    if slices.iter().enumerate().all(|(i, want)| match (want, physical.slice_at(base + i * PAGE)) {
+        (Some(want), Some(have)) => want.index == have.index && Arc::ptr_eq(&want.section, &have.section),
+        _ => false,
+    }) {
+        return address;
+    }
+    unmap(&mut physical, base, n * PAGE);
     let mut i = 0;
     while i < n {
         let Some(first) = slices[i].clone() else {
