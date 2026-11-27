@@ -1049,3 +1049,36 @@ That is worth stating plainly because it changes what the next session should
 do: **there is no overlap to win back on this title's submission path.** The
 frame is 31 ms of preparing plus 77 ms of card, in series, and the only levers
 left are on the terms themselves.
+
+### `land_card`: both suspects are ruled out, by running them
+
+The two-switch experiment the earlier note left unrun has now been run, three
+times, on `host::refresh_tests::landings_title_writes_and_light_refreshes_at_once`:
+
+| switches | result |
+|---|---|
+| none (baseline) | FAILED |
+| `VICTORY_SEND_CHANGED=0` | FAILED |
+| `VICTORY_LAND_ECHO=0` | FAILED |
+
+So neither the whole-page road nor `take_landed` is what puts the shader's dword
+into the skip list. The failure is unchanged in all three:
+
+```
+not landed: expected at least 6 at offset 0xc50c (class 3), found 4
+```
+
+`0xc50c % 32 == 12`, and class 3's lane is `4 * 3 == 12`, so it is the shader's
+own dword — the title never wrote it. Title memory still holds the older `4`.
+
+**A lead the experiment leaves standing.** `bring()` only resends a page when it
+has never been taken (`if never { shadow.resend(base, base + PAGE) }`), so the
+whole-page road cannot explain a page the test has written to for several
+rounds — which is the same reason suspect 1 was weak. What is left is
+`sent.near(fetched_after, from, to, &mut skip)`: `dirty` is filtered by the
+fetch's send number, and if a range in it has not actually gone up yet, it is
+skipped as though it had. That is suspect 2, and it is the only one still
+standing.
+
+Nothing here is a fault in the game: the consequence is a stale dword where the
+title and a shader write the same 32 bytes, invisible unless something reads it.
