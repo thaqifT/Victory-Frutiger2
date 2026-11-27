@@ -426,3 +426,108 @@ cut the pixels 44 % and the GPU time only 82.4 -> 71.1 ms, so the GPU is not
 fill-bound; it is geometry, compute or barriers. The host runs real mesh
 shaders (`host mesh shader support mesh=true`, tier 1, shader model 6.6 on the
 RX 6800), so amplification is not being emulated either.
+### Where a frame goes, and the barrier count (`gd12`, `gd13`)
+
+The line that splits the preparing says it plainly (world band, `gd12`):
+
+    20.9 in the lists' steps (refreshes 15.3 in 47 flushes of 5516, 4699 of them
+    known to copy nothing, 4756 on several threads, 1.7 one at a time in 319
+    before shader writes; copies and fills 1.3), 5.8 asking the write watch,
+    2.7 snapshots, 5.8 for copies in the card's memory
+
+84 % of the refreshes are already known to copy nothing before they start, and
+the ones left cost 18.7 us each -- the copy, not the check. `nothing_new` at
+~5 ms of all threads' time is 3 % of a 175 ms frame, which is why `gd12`'s lock
+work measured nothing.
+
+`gd13` is the run with the library held instead of mapped: 0 first-chance,
+0 unhandled, 0 device removed, 0 panicked, best 31 fps, peak 20,515 MB. Its
+world band medians are 126.0 ms with 36.8 preparing, 69.4 on the GPU and 15.3
+copying back, against `gd12`'s 178.2 / 56.4 / 87.0 / 26.9. **That is not a
+2x win from the library fix** -- the scenes differ (1,911 draws a frame against
+5,500) and cross-run frame times cannot be compared here at all. What `gd13`
+says is that the library fix is stable, which is what it was for.
+
+### The barriers, and how to measure them
+
+    waits for every earlier shader write, per frame: 763 for the title's
+    barrier groups, 0 for its barriers on buffers; 136 indirect commands
+    bounded (a dispatch of ours between two such waits each)
+
+1,082 of them in a heavier second. Both call sites -- `list.rs`'s `sync` (the
+title's pipeline syncs) and `barrier_groups` (its enhanced barriers) -- throw
+the arguments away and record one global `UAV_BARRIER` (`kind: 2`,
+`first: null`), which waits for every earlier shader write in the pipeline.
+Upstream is the same: `fxeless/victory-fork` main's `barrier_groups` has the
+same `_groups` and the same comment, "one barrier on every shader write". So
+this is not a port; nobody has done it.
+
+Two of every three are ours: 136 indirect clamps x 2 waits each = 272 of the
+763, from the pass that bounds an indirect command (`VICTORY_BARRIER_TEST` bit
+1 drops exactly those).
+
+`VICTORY_BARRIER_TEST` now counts the syncs apart from the groups
+(`WaitsForSync`), gained bit 2 (`sync`) and `all`, and can be named in
+`VICTORY_AB` -- both sides, one run, one scene. That last part matters: the
+draw count swings 400 to 7,900 inside a run, so two runs never compare.
+
+fxeless #867 tracks a per-list `uav_dirty` flag (set by UAV-writing
+dispatches, storing draws, copies; cleared by a global UAV barrier) and skips
+the barrier when nothing has written since. Its measured wins came from
+pipeline waits and texture staging, not from that item.
+### The barriers cost nothing (`gd14`)
+
+`gd14` ran the whole barrier experiment as a `VICTORY_AB` switch, so both sides
+were measured in one run and one scene -- the only valid comparison here (the
+draw count swings 400 to 7,900 inside a run). 25 s phases, one switch, so odd
+phases dropped every wait for earlier shader writes and even phases kept them:
+
+| phase | waits | frames | mean ms | median ms | draws |
+|---|---|---|---|---|---|
+| 3 | dropped | 105 | 228.8 | 209.4 | 3412 |
+| 4 | kept | 128 | 187.9 | 162.6 | 1522 |
+| 5 | dropped | 133 | 180.5 | 147.0 | 1419 |
+| 6 | kept | 126 | 191.7 | 182.6 | 1586 |
+| 7 | dropped | 145 | 169.5 | 114.9 | 1314 |
+
+Per draw, which is the only way to compare phases with different scenes:
+dropped 0.0671, 0.1272, 0.1290 ms; kept 0.1234, 0.1209 ms. The dropped phases
+are not faster -- the middle two pairs differ by 3 % one way and 24 % the
+other, with p90s from 177 to 300 ms, which is scene noise. **763-1,082 global
+UAV barriers a frame cost nothing measurable on this driver and this card.**
+
+So `fxeless` #867's per-list `uav_dirty` flag is not worth porting. Its own
+measured wins came from pipeline waits and texture staging, not that item, and
+this measurement says the same from the other side.
+
+Two more things `gd14` settled:
+
+- **The title never calls `sync`.** `WaitsForSync` is 0 in every line of the
+  run, so all 763 are `barrier_groups` (its enhanced barriers). `VICTORY_BARRIER_TEST`
+  bit 2 is dead weight; `list.rs`'s `sync` path is exercised only if the title
+  ever starts calling it.
+- The experiment flips `exp=0` / `exp=7` exactly as the phases say, so the
+  switch really did reach both call sites.
+
+0 first-chance, 0 unhandled, 0 device removed, 0 panicked, best 31 fps, peak
+21,199 MB.
+
+### The freezes are pipeline waits, and one frame's worth is enough (`#1181`, `#1234`)
+
+The worst frames of the two stable runs, from `looks\<tag>\fps.txt`:
+1,399.7 ms (`gd13`), 1,223.1, 1,034.0, 760.2, 625.8 ms (`gd14`). Those are
+not fill: they are the title binding a pipeline the worker has not made, and
+the wait budget (`VICTORY_PIPELINE_WAIT_MS`, 500 ms a frame, shared across
+threads) being spent on it -- in **every** frame that draws with it.
+
+`fxeless` #1234 fixes the shape of that: a pipeline is waited for in one frame
+only (`Pending::waited_frame`, claimed with `compare_exchange` and only while
+the frame still has budget). A compile the worker has not finished in that
+frame is skipped in later frames instead of taking the whole budget again.
+`VICTORY_PIPELINE_WAIT_EVERY_FRAME=1` restores the old behaviour, and the
+switch is `crate::ab`-able, so it can be A/B'd in one run.
+
+Note the frame line already reports the cost of *not* waiting: `dropped 1342
+without a host pipeline (0 being made)`. Those draws do not happen -- the
+frame is cheaper and the scene is missing pieces. That is the trade the old
+behaviour made the other way round.
