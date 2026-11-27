@@ -531,3 +531,48 @@ Note the frame line already reports the cost of *not* waiting: `dropped 1342
 without a host pipeline (0 being made)`. Those draws do not happen -- the
 frame is cheaper and the scene is missing pieces. That is the trade the old
 behaviour made the other way round.
+### Write-combining reads are the copy-back, and no code beats the hardware (`gd14`)
+
+The frame account line splits the two directions exactly:
+
+    what shaders wrote: 2.8 ms finding 438 pieces that differ, 13.6 ms putting them back
+
+13.6 ms for the pieces put back. The frame line puts the same band at 24.4 ms
+for 8.5 MB. 8.5 MB over 13.6 ms is **645 MB/s**, and that is not a slow loop:
+it is what reading write-combining memory costs. A WC read is one uncached
+fetch per 64-byte line, ~100 ns each, and 64 B / 100 ns is 640 MB/s. The copy
+back reads title memory (`read_into`) before it writes, so that the title's own
+concurrent writes to the same buffer are not clobbered -- it reconstructs what
+the memory held (`was = now ^ changed`) and writes only the dwords the card
+changed. The read is the price of not clobbering, and at 645 MB/s it is already
+at the hardware's limit.
+
+The other direction is the same shape: `refreshes 25.0 in 48 flushes of 5140,
+4266 of them known to copy nothing` -- 874 of them do, and they read title
+memory into the shadow at the same per-line cost.
+
+**So 38.6 ms of a 248 ms frame (16 %) is reading write-combining memory, and
+no tighter loop, wider copy or non-temporal load changes it.** The only lever
+is to read fewer bytes, which needs to know which title memory the title never
+reads back. That is exactly what `fxeless` #868's census is for, and why its
+switch (`VICTORY_SKIP_WC_COMPARE`) is "leave write-combining memory on the
+card" and not "copy it faster".
+
+The rest of the account, for the record (248 ms frame, 2395 draws):
+
+    after a present 22.5 ms until the first list call and 1.3 ms until the
+    first submission; 0.0 ms from the last submission to the present call;
+    lists reset in 14.8 ms; the process ran 471 ms user + 159 ms kernel on all
+    threads
+
+and the card:
+
+    the card's clock per frame: nothing of ours queued 202.2 ms (the card about
+    28% busy by this count), 188.5 ms of that while the submitting thread was
+    working (the card idle behind us), the rest while the title had not
+    submitted; the submitting thread stood waiting for the card 80.3 ms
+
+28 % busy. The card is idle most of the frame, and 188.5 ms of that idle time
+is while our own side is still working. That is the frame-overlap prize, and it
+is the one worth the most: it needs no new rendering, only submissions that
+leave while the next one is prepared.

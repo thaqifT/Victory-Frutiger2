@@ -459,6 +459,14 @@ fn shared_budget() -> bool {
 /// old behaviour), not only in the first one that had budget for it.
 /// `VICTORY_PIPELINE_WAIT_EVERY_FRAME=1`: every frame, as before #1181.
 fn wait_every_frame() -> bool {
+    // Diagnostics: named in `VICTORY_AB`, it changes while the title runs.
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: OnceLock<Option<u32>> = OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_PIPELINE_WAIT_EVERY_FRAME")) {
+            return crate::ab::on(bit);
+        }
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_EVERY_FRAME").is_some_and(|v| v == "1"))
 }
