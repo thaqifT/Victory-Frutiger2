@@ -5388,6 +5388,8 @@ impl Host {
             if wide_merge() && pieces.len() >= 8 {
                 // The pieces are apart from one another (each its own bytes
                 // of its copy and of title memory): several at a time.
+                #[cfg(feature = "diagnostics")]
+                let merging = std::time::Instant::now();
                 let fetched = *data;
                 let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> =
                     std::sync::Arc::new((0..plan.ranges.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect());
@@ -5416,7 +5418,18 @@ impl Host {
                 for (written, count) in written.iter_mut().zip(counts.iter()) {
                     *written += count.load(Ordering::Relaxed);
                 }
+                // Counted where the CPU's own merge is (`BackSyncUs`): it is
+                // the same job on the same bytes, and the frame line's
+                // "putting them back" is the whole of it either way.
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::BackSyncUs, merging.elapsed().as_micros() as u64);
+                    add(C::BackDiffer, pieces.len() as u64);
+                }
             } else {
+                #[cfg(feature = "diagnostics")]
+                let merging = std::time::Instant::now();
                 let mut title = Vec::new();
                 for &(i, lo, hi, at) in &pieces {
                     // SAFETY: the mapping of the fetched bytes, `total` of
@@ -5425,6 +5438,12 @@ impl Host {
                     let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
                     plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
                     written[i] += merged;
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::BackSyncUs, merging.elapsed().as_micros() as u64);
+                    add(C::BackDiffer, pieces.len() as u64);
                 }
             }
         }
