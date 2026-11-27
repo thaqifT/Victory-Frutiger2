@@ -79,11 +79,21 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 pub(crate) static BLOB: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAVED: AtomicU64 = AtomicU64::new(0);
 
+/// Bytes of zeroes held after the library's own, that no reader of the blob
+/// sees. The driver reads two bytes past the end of a pipeline library it is
+/// given: a mapping ends exactly at the file's last byte (and
+/// `CreateFileMappingW` refuses a view larger than the file at all -- error
+/// 8), so a mapped blob cannot have them, and the library is held instead.
+const SLACK: usize = 0x4000;
+
 /// Whether the library's file is mapped ([`Blob`]) and saved through a
-/// mapping. On by default; `VICTORY_LIBRARY_MAP=0` uses buffers, as before.
+/// mapping. Off by default: a mapped blob has no [`SLACK`], and the driver's
+/// read past the end of one is the boot fault of runs `gc5` and `gc6` (see
+/// `docs/findings.md`). `VICTORY_LIBRARY_MAP=1` maps it again; saves are
+/// always through a mapping.
 fn mapped() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_MAP").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_MAP").is_some_and(|v| v == "1"))
 }
 
 /// Whether the mapped library file's handle is kept open while it is
@@ -107,18 +117,11 @@ struct Mapped {
 }
 
 impl Mapped {
-    /// Bytes of zeroes mapped after a library's own: the host's compiler
-    /// reads a little past the end of what it is given. `amdxc64.dll` read
-    /// two bytes past the end of an exactly page-sized library on an RX 6800
-    /// (`amdxc64+0x176cd5`, `r13 = 0x...3ffe`, read at `0x...4000`: nothing
-    /// mapped there), which ended the boot about half the time -- the half
-    /// whose library file happened to land on a page. A view that ends with
-    /// the file has nothing mapped past it; four pages of slack always do.
-    const SLACK: usize = 0x4000;
-
     /// Maps `file` (`len` bytes, not zero) for reading, or for reading and
-    /// writing. `slack`: map [`Mapped::SLACK`] bytes of zeroes after it too.
-    fn map(file: &std::fs::File, len: usize, write: bool, slack: usize) -> Option<Mapped> {
+    /// writing. The view is the file exactly: `CreateFileMappingW` refuses a
+    /// larger one (error 8, `ERROR_NOT_ENOUGH_MEMORY`, measured on Windows
+    /// 11 26100), so a mapping can never carry the zeroes [`SLACK`] is for.
+    fn map(file: &std::fs::File, len: usize, write: bool) -> Option<Mapped> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
@@ -127,9 +130,7 @@ impl Mapped {
         if len == 0 {
             return None;
         }
-        // A writable mapping larger than the file would grow the file.
-        let slack = if write { 0 } else { slack };
-        let view = len.checked_add(slack)?;
+        let view = len;
         // SAFETY: a file we hold open; the view keeps the file's pages
         // after the mapping object and the file are closed.
         let at = unsafe {
@@ -165,7 +166,7 @@ impl Mapped {
         // renames the new library over this one.
         let file = std::fs::File::open(path).ok()?;
         let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
-        let mut mapped = Mapped::map(&file, len, false, Mapped::SLACK)?;
+        let mut mapped = Mapped::map(&file, len, false)?;
         if hold {
             mapped._file = Some(file);
         }
@@ -183,7 +184,7 @@ impl Mapped {
             .open(path)
             .ok()?;
         file.set_len(len as u64).ok()?;
-        Mapped::map(&file, len, true, 0)
+        Mapped::map(&file, len, true)
     }
 
     fn bytes(&self) -> &[u8] {
@@ -210,14 +211,31 @@ impl Drop for Mapped {
 enum Blob {
     /// No file (an empty library).
     None,
-    /// The file read into memory (`VICTORY_LIBRARY_MAP=0`, tests, or a file
-    /// that could not be mapped).
+    /// The file read into memory with [`SLACK`] zeroes after it (the default;
+    /// `VICTORY_LIBRARY_MAP=1` maps it instead, tests, or a file that could
+    /// not be mapped).
     Held(Vec<u8>),
-    /// The file itself, mapped.
+    /// The file itself, mapped. No slack: only with `VICTORY_LIBRARY_MAP=1`,
+    /// which the driver's read past the end can fault on.
     Mapped(Mapped),
 }
 
 impl Blob {
+    /// The file at `path` read into memory, with [`SLACK`] zero bytes after
+    /// it that [`Blob::bytes`] does not show. The driver reads two bytes past
+    /// the end of a library it is given; here those bytes are ours, in the
+    /// same allocation, and a read of them cannot fault.
+    fn read_padded(path: &std::path::Path) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+        let mut bytes = vec![0u8; len.checked_add(SLACK)?];
+        file.read_exact(&mut bytes[..len]).ok()?;
+        // Keeps the allocation; only the length the blob shows changes.
+        bytes.truncate(len);
+        Some(bytes)
+    }
+
     /// The library file in `dir`: a library a save left beside it
     /// ([`NEXT_FILE`]) takes its place first.
     fn of(dir: &std::path::Path) -> Blob {
@@ -231,8 +249,8 @@ impl Blob {
         {
             return Blob::Mapped(file);
         }
-        match std::fs::read(&path) {
-            Ok(bytes) if !bytes.is_empty() => Blob::Held(bytes),
+        match Self::read_padded(&path) {
+            Some(bytes) if !bytes.is_empty() => Blob::Held(bytes),
             _ => Blob::None,
         }
     }
@@ -484,7 +502,12 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
             Ok(library) => {
                 let bytes = blob.bytes().len();
                 BLOB.store(bytes as u64, Ordering::Relaxed);
-                tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
+                tracing::info!(
+                    bytes,
+                    mapped = matches!(blob, Blob::Mapped(_)),
+                    slack = if matches!(blob, Blob::Held(_)) { SLACK } else { 0 },
+                    "host pipeline library loaded"
+                );
                 if let Blob::Mapped(file) = &blob {
                     VIEW[1].store(file.len, Ordering::Relaxed);
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
