@@ -104,7 +104,8 @@ window, and closed on evidence. They are written down so nobody re-tests them.
 | `VICTORY_PORT_DESCRIPTORS` (port 2) | 1.17 ms/frame cost, no saving; the scan it replaces does not exist here |
 | `VICTORY_PORT_GUARD` (port 6) | measured, off |
 | `VICTORY_PORT_JOURNAL` (port 7) | measured, off |
-| `kernel: GetWriteWatch` write-watch | 2.37 ms/frame, 1.1 % — not the cost |
+| `kernel: GetWriteWatch` write-watch | 2.37 ms/frame, 1.1 % — the asking is not the cost; the *refusal* is (see below) |
+| the refusal fallback, before `VICTORY_WATCH_HEAP` | 516 guard walks a frame over 8,948.9 MB, 16.36 ms, to find 60 MB changed |
 | `VICTORY_SYNC_FINE` | inside the noise: +3.0 % one window, −5.7 % the next |
 | card-buffer pair `MIN_KB=64` / `MB=1536` | loses badly, 217.7 ms against 123.7; mapping causes explode |
 | `VICTORY_LATE_*` | removes the device within 40–110 s with every knob off |
