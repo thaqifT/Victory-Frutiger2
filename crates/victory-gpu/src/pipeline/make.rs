@@ -191,12 +191,14 @@ impl Drop for Compile {
 
 /// Installs the handler for the driver's compiler crashing (AMD's does on an
 /// RX 9070 XT, and not on the same pipelines in every run: an access of the
-/// first pages in `amdxc64.dll`) and the thread that deals with what it
-/// left. The handler does the least there is: it notes where, signals, and
-/// leaves the worker asleep for good. No allocation, no lock, no file: the
-/// crash may have been under any of them. The watcher puts the pipeline on
-/// the list of those left out (`warm-bad.txt`), says it is not made, gives
-/// the worker's place in the counts back and starts another worker.
+/// first pages in `amdxc64.dll`; and on an RX 6800 it reads past the end of
+/// a shader's blob while it compiles the pipeline for it) and the thread that
+/// deals with what it left. The handler does the least there is: it notes
+/// where, signals, and leaves the worker asleep for good. No allocation, no
+/// lock, no file: the crash may have been under any of them. The watcher puts
+/// the pipeline on the list of those left out (`warm-bad.txt`), says it is not
+/// made, gives the worker's place in the counts back and starts another
+/// worker.
 fn guard_start() {
     use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
     use windows_sys::Win32::System::Threading::CreateEventW;
@@ -235,7 +237,13 @@ unsafe extern "system" fn compiler_crashed(
     const CONTINUE_SEARCH: i32 = 0;
     // SAFETY: the system passes a live record.
     let record = unsafe { &*(*info).ExceptionRecord };
-    if record.ExceptionCode != ACCESS_VIOLATION || record.NumberParameters < 2 || record.ExceptionInformation[1] >= 0x10000 {
+    // Where the fault read: low on AMD's compiler for a null the title's
+    // descriptor left (the first pages of `amdxc64.dll`), and past the end
+    // of a mapped blob for the same compiler walking a shader it was given
+    // (`0x19905a14000` in run rv1, 2 bytes into the page after the blob).
+    // Both are the compiler's, and both kill the boot if let through: the
+    // address is recorded, not judged.
+    if record.ExceptionCode != ACCESS_VIOLATION || record.NumberParameters < 2 {
         return CONTINUE_SEARCH;
     }
     if !COMPILING.try_with(|c| c.get()).unwrap_or(false) {
