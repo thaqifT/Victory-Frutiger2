@@ -1029,7 +1029,15 @@ pub(crate) fn once() -> bool {
     // On by default since run 81 (with card buffers: 375-450 ms a frame
     // against 573-647, the picture unchanged over four minutes);
     // `VICTORY_ASK_ONCE=0` asks per range, as before.
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
+    let default_on = || *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"));
+    // On the A/B rail since gd1: the union this asks about is one range per
+    // copy, and `GetWriteWatch` refuses a range whole if one page of it is not
+    // write-watchable, so the wider the union the likelier the asking is lost.
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_ASK_ONCE").unwrap_or_else(default_on);
+    #[cfg(not(feature = "diagnostics"))]
+    let on = default_on();
+    on
 }
 
 /// With [`once`]: asks about `ranges` (everything a submission's lists
@@ -2246,6 +2254,23 @@ impl Blocks {
     fn len(&self) -> usize {
         self.0.count()
     }
+
+    /// Whether every block of `[first, last)` is in it: a word at a time, which
+    /// is what a look over a range of tens of thousands of blocks costs
+    /// (`range(..).count()` visits every block that is in it, and nearly all
+    /// are: 44,600 of them for the title's 174 MB heap, eight times a frame).
+    fn all(&self, first: usize, last: usize) -> bool {
+        if first >= last {
+            return true;
+        }
+        for word in first / 64..last.div_ceil(64) {
+            let mask = in_word(word * 64, first, last);
+            if self.word(word) & mask != mask {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Of the 64 blocks from `at` on, those in `[from, to)`, a bit each.
@@ -2689,6 +2714,31 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    /// Whether every block of `[first, last)` is clean, so that the range was
+    /// not written since it was last taken and the whole walk can be skipped.
+    ///
+    /// `range(..).count()` visits every block that *is* clean — and nearly all
+    /// are: the guards make 641 such looks a frame over 13 GB, 3.19 million
+    /// blocks, and the test fails on the first block that is not, after having
+    /// counted the rest. [`Blocks::all`] reads a word at a time and fails on
+    /// the first word that is not all set. `VICTORY_GUARD_WHOLE=0` puts the
+    /// block walk back, so one scene can settle it on the A/B rail.
+    fn guard_whole(g: &Guards, first: usize, last: usize) -> bool {
+        fn worded() -> bool {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let default_on = || *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_WHOLE").is_none_or(|v| v != "0"));
+            #[cfg(feature = "diagnostics")]
+            let on = crate::ab::pick("VICTORY_GUARD_WHOLE").unwrap_or_else(default_on);
+            #[cfg(not(feature = "diagnostics"))]
+            let on = default_on();
+            on
+        }
+        if worded() {
+            g.clean.all(first, last)
+        } else {
+            g.clean.range(first..last).count() == last - first
+        }
+    }
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -2714,7 +2764,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
         let of = |g: &Guards| -> Option<Vec<usize>> {
-            if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
+            if guard_whole(g, first, last) && !BESIDE.any(first, last) {
                 return None;
             }
             Some(g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect())
