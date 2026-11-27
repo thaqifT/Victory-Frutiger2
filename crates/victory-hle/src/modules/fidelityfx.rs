@@ -1,7 +1,8 @@
-//! `amd_fidelityfx_loader_xbox.dll`: AMD FidelityFX's API, served by the
-//! host's PC build of it on the host GPU when the user names a folder that
-//! holds one (`VICTORY_FIDELITYFX_DIR`) and selects a 4K FSR profile.
-//! Other profiles keep the title's own console DLLs.
+//! `amd_fidelityfx_loader_xbox.dll` and `amd_fidelityfx_upscaler_xbox.dll`:
+//! AMD FidelityFX's API, served by the host's PC build of it on the host GPU
+//! when the user names a folder that holds one (`VICTORY_FIDELITYFX_DIR`) and
+//! selects a 4K FSR profile. Other profiles keep the title's own console
+//! DLLs.
 //!
 //! Both builds have the same API (the FidelityFX SDK's, MIT): five functions
 //! over chains of descriptions, each starting with a type id and the next
@@ -753,7 +754,13 @@ fn record_dispatch(
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "fidelityfx",
-        dlls: &["amd_fidelityfx_loader_xbox.dll"],
+        // The loader and the upscaler it loads: on the console the second is a
+        // separate module, and the title loads it by name once the picker
+        // returns FidelityFX. Both are this one provider here.
+        dlls: &[
+            "amd_fidelityfx_loader_xbox.dll",
+            "amd_fidelityfx_upscaler_xbox.dll",
+        ],
         exports: vec![
             hle_export!(ffxConfigure),
             hle_export!(ffxCreateContext),
