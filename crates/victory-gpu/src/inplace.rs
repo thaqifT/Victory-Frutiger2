@@ -1,4 +1,4 @@
-//! Title memory as the card's own memory: a host heap opened on memory
+﻿//! Title memory as the card's own memory: a host heap opened on memory
 //! the title already has, and a buffer placed in it, so that shaders read
 //! and write the title's bytes themselves and no host copy stands between
 //! (the console's one memory). This file holds the two openings Direct3D
@@ -37,6 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -191,6 +192,8 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 pub fn title_memory_freeing(at: usize, len: usize) {
     // Renderer port 1's regions there: no longer what the title shows.
     crate::port::forget(at, len);
+    // The constants heap's regions over pages the title maps anew.
+    constants_forget(at as u64, len as u64);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -214,6 +217,313 @@ fn say() {
         s[1] >> 20,
         s[2],
         s[3] >> 20,
+        s[4],
+        s[5],
+        s[6],
+        s[7]
+    );
+}
+
+/// The title's constants heap in place (`VICTORY_INPLACE_CONSTANTS`).
+///
+/// The title's 174 MB constants heap is view memory (the page pool): a run of
+/// one section, committed whole, below 4 GiB. `OpenExistingHeapFromAddress1`
+/// takes a committed view of a section, so a view of ours of the same pages
+/// opens it as a heap, and every title buffer in the heap is placed in that
+/// heap instead of being copied: the card reads and writes the title's own
+/// pages. Nothing is sent up, hashed, compared or fetched for them, and the
+/// copy's snapshot (the whole 174 MB, made once) is never made again.
+///
+/// What it costs the card: its reads of the heap cross the bus (fxceless's
+/// run 75: a skinning list 4.5 ms in the card's memory, 50.5 ms over the
+/// bus); what it saves: our send, hash and compare passes over it.
+///
+/// shortcut: another host copy of bytes in the heap that is not a title
+/// buffer (a texture placed in it) is not told what the card wrote there
+/// (as for every copy in place, `Shadow::gpu_writes`).
+pub(crate) fn constants_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_INPLACE_CONSTANTS").ok().as_deref().map(str::trim) {
+        Some("1") => {
+            tracing::info!("the constants heap is read and written by the card in place (VICTORY_INPLACE_CONSTANTS=1)");
+            true
+        }
+        Some("alt") => {
+            tracing::warn!(
+                "VICTORY_INPLACE_CONSTANTS=alt turned down: a title buffer cannot change form while the title runs (descriptor slots keep the copy \
+                 they were made with); the constants heap stays a copy"
+            );
+            false
+        }
+        _ => false,
+    })
+}
+
+/// The least size of a title buffer that opens a region
+/// (`VICTORY_INPLACE_CONSTANTS_MIN_MB`, 64), in bytes.
+fn constants_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("VICTORY_INPLACE_CONSTANTS_MIN_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 20)
+}
+
+/// The title's graphics memory for 32-bit addresses lies below this.
+const LOW: u64 = 1 << 32;
+
+/// A region: the 64 KiB pages of a title buffer, opened as a heap through
+/// a view of ours of the same section pages.
+struct Region {
+    start: u64,
+    end: u64,
+    heap: ID3D12Heap,
+}
+
+static REGIONS: Mutex<Vec<Region>> = Mutex::new(Vec::new());
+
+/// How many regions there are, for a look without the lock (every mapping
+/// the runtime changes asks [`constants_forget`]).
+static ALIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Since the start: regions opened, their bytes; title buffers placed in
+/// them; asks turned down because the memory is not one run of a section,
+/// because no view of ours could be made or committed, because the host
+/// refused, because a title buffer in it had a copy already; regions
+/// forgotten because the title mapped other pages there.
+static CSTATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Whether `[start, start + len)` opens a region of at least `min` bytes:
+/// below 4 GiB and view memory that is one run of a section.
+///
+/// A range turned down is said once for each reason: which of the three the
+/// title's memory failed is the whole answer to "why is nothing in place".
+fn constants_wanted(start: u64, len: u64, min: u64) -> bool {
+    if len < min.max(1) {
+        small_say(start, len, min, "smaller than VICTORY_INPLACE_CONSTANTS_MIN_MB");
+        return false;
+    }
+    if !start.checked_add(len).is_some_and(|end| end <= LOW) {
+        high_say(start, len, LOW, "not below 4 GiB");
+        return false;
+    }
+    let cover = cover(start as usize, len as usize);
+    if matches!(cover, Cover::Run(..)) {
+        return true;
+    }
+    // Not one run of a section: the title's own private memory, if it is one
+    // whole committed allocation (`From::Part` opens that as it stands).
+    if private_whole(start as usize, len as usize) {
+        return true;
+    }
+    cover_say(start, len, cover);
+    false
+}
+
+/// The first eight ranges turned down for being too small.
+fn small_say(start: u64, len: u64, min: u64, why: &str) {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            len,
+            min,
+            why,
+            "the constants heap not in place: a copy as before (VICTORY_INPLACE_CONSTANTS)"
+        );
+    }
+}
+
+/// The first eight ranges turned down for reaching past 4 GiB.
+fn high_say(start: u64, len: u64, low: u64, why: &str) {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            len,
+            low,
+            why,
+            "the constants heap not in place: a copy as before (VICTORY_INPLACE_CONSTANTS)"
+        );
+    }
+}
+
+/// The first eight ranges turned down because the title's views do not hold
+/// them as one run of one section. The count of views at the time is the
+/// thing to look at: no views at all means the title's mappings were never
+/// told to us.
+fn cover_say(start: u64, len: u64, cover: Cover) {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+        let views = views();
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            len,
+            cover = ?cover,
+            views = views.views.len(),
+            bytes = views.views.values().map(|view| view.0 as u64).sum::<u64>(),
+            sections = views.sections.len(),
+            "the constants heap not in place: a copy as before (VICTORY_INPLACE_CONSTANTS)"
+        );
+    }
+}
+
+/// The 64 KiB pages `[at, end)` that hold `[start, start + len)`.
+pub(crate) fn pages_of_range(start: u64, len: u64) -> (u64, u64) {
+    (start & !(K64 as u64 - 1), (start + len.max(1)).next_multiple_of(K64 as u64))
+}
+
+/// A title buffer `[start, start + len)` that has no copy yet, in place in
+/// a region: one that holds it, or one it opens if it is wanted and
+/// `fresh` (no title buffer in its pages has a copy). `None` leaves the
+/// caller to make a copy, as before.
+pub(crate) fn place_constants(start: u64, len: u64, fresh: bool) -> Option<Placed> {
+    if !constants_on() {
+        return None;
+    }
+    let host = crate::host::host()?;
+    match constants_place(&host.device, start, len, constants_min(), fresh) {
+        Ok(Some(placed)) => {
+            STATS[2].fetch_add(1, Ordering::Relaxed);
+            STATS[3].fetch_add(len, Ordering::Relaxed);
+            CSTATS[2].fetch_add(1, Ordering::Relaxed);
+            Some(placed)
+        }
+        Ok(None) => None,
+        Err((stat, why)) => {
+            if CSTATS[stat].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, why, "the constants heap not in place: a copy as before (VICTORY_INPLACE_CONSTANTS)");
+            }
+            None
+        }
+    }
+}
+
+/// [`place_constants`]' work on `device`: `Ok(None)` if no region holds the
+/// buffer and it opens none (nothing asked of the host), `Err` with the
+/// statistic to count and why.
+fn constants_place(device: &ID3D12Device, start: u64, len: u64, min: u64, fresh: bool) -> Result<Option<Placed>, (usize, String)> {
+    let (at, end) = pages_of_range(start, len);
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match regions.iter().position(|r| r.start <= at && end <= r.end) {
+        Some(i) => i,
+        None => {
+            if !constants_wanted(at, end - at, min) {
+                return Ok(None);
+            }
+            if !fresh {
+                return Err((6, "a title buffer in its pages has a copy already".to_owned()));
+            }
+            let region = constants_open(device, at, end)?;
+            CSTATS[0].fetch_add(1, Ordering::Relaxed);
+            CSTATS[1].fetch_add(end - at, Ordering::Relaxed);
+            tracing::info!(
+                start = format_args!("{at:#x}"),
+                bytes = end - at,
+                "a title buffer of the constants heap in place: the card reads and writes the title's pages through a view of ours (VICTORY_INPLACE_CONSTANTS)"
+            );
+            regions.push(region);
+            ALIVE.store(regions.len() as u64, Ordering::Relaxed);
+            regions.len() - 1
+        }
+    };
+    let region = &regions[i];
+    let buffer = place(device, &region.heap, at - region.start, end - at).map_err(|e| (5, format!("no buffer placed in the region: {e}")))?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    Ok(Some(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at }))
+}
+
+/// Opens `[at, end)` (64 KiB aligned title view memory, one run of a
+/// section) as a heap through a view of ours of the same section pages.
+/// Opening locks the pages into the PC's memory (the title's views have
+/// committed them all already): some tens of ms for the 174 MB, once.
+///
+/// shortcut: the view of ours is never unmapped (a view a heap stands on
+/// cannot be, and the heap goes only when the last placed buffer does): a
+/// region's bytes of address space each time the title maps other pages
+/// over one, which it was not seen to do.
+fn constants_open(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
+    let bytes = (end - at) as usize;
+    let Cover::Run(section, offset) = cover(at as usize, bytes) else {
+        // Not one run of a section: the title's own private memory, opened
+        // where the title holds it (`From::Part`). The GPU then reads and
+        // writes the title's bytes at the title's address: no copy, and the
+        // title's writes are the card's bytes with nothing in between.
+        if !private_whole(at as usize, bytes) {
+            return Err((3, format!("not one run of a section: {:?}", cover(at as usize, bytes))));
+        }
+        return match open(device, From::Part(at as usize, bytes)) {
+            Ok(heap) => Ok(Region { start: at, end, heap }),
+            Err(e) => Err((5, format!("refused by the host: {e}"))),
+        };
+    };
+    if !offset.is_multiple_of(K64 as u64) {
+        return Err((3, format!("the run starts at {offset:#x} of its section")));
+    }
+    // SAFETY: the section of a view the title has (the runtime keeps its
+    // handle while views of it are mapped; a view keeps the section alive
+    // after that); the range lies in the run.
+    let view = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes) }.Value;
+    if view.is_null() {
+        return Err((4, format!("no view of ours: {}", std::io::Error::last_os_error())));
+    }
+    let unmap = || {
+        // SAFETY: our own view, nothing opened on it.
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view }) };
+    };
+    // The title's views committed these section pages when they were
+    // mapped; asked once more through ours (a reserved section's pages are
+    // committed through a view), which changes nothing if they are.
+    // SAFETY: inside our own view.
+    if unsafe { mem::VirtualAlloc(view, bytes, mem::MEM_COMMIT, mem::PAGE_READWRITE) }.is_null() {
+        let error = std::io::Error::last_os_error();
+        unmap();
+        return Err((4, format!("the view of ours not committed: {error}")));
+    }
+    match open(device, From::Part(view as usize, bytes)) {
+        Ok(heap) => Ok(Region { start: at, end, heap }),
+        Err(e) => {
+            unmap();
+            Err((5, format!("refused by the host: {e}")))
+        }
+    }
+}
+
+/// The title maps other pages at `[at, at + len)`: the regions over it are
+/// forgotten (what is placed in them is let go by [`title_memory_freeing`]).
+fn constants_forget(at: u64, len: u64) {
+    if ALIVE.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = regions.len();
+    regions.retain(|r| r.end <= at || r.start >= end);
+    ALIVE.store(regions.len() as u64, Ordering::Relaxed);
+    CSTATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
+}
+
+/// The line of the constants heap in place, every ten seconds while the
+/// switch is on (called by [`tick`]).
+fn constants_say() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let s: Vec<u64> = CSTATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let (alive, bytes) = {
+        let regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        (regions.len(), regions.iter().map(|r| r.end - r.start).sum::<u64>())
+    };
+    tracing::info!(
+        "the constants heap in place (VICTORY_INPLACE_CONSTANTS=1): {alive} regions {} MB (opened so far {}, {} MB), {} title buffers placed in them so far \
+         (no copy, no refresh, nothing sent up, hashed, compared or fetched for them); turned down: {} not one run of a section, {} no view of ours, \
+         {} refused by the host, {} a title buffer in its pages had a copy already; {} regions forgotten because the title mapped other pages there",
+        bytes >> 20,
+        s[0],
+        s[1] >> 20,
+        s[2],
+        s[3],
         s[4],
         s[5],
         s[6],
@@ -1265,6 +1575,9 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 pub(crate) fn tick() {
     if level() > 0 {
         say();
+    }
+    if constants_on() {
+        constants_say();
     }
     if probe_level() == 0 {
         return;

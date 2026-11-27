@@ -77,7 +77,12 @@ codegen-units = 1
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
 # kept in its own folder so it does not evict the plain release build.
+#
+# LTO and one codegen unit, same as `release`: the point of this build is to
+# measure with the metering on, and a `lto = false`, `codegen-units = 16`
+# binary measures the codegen as much as the game. (Frutiger2: every fps
+# quoted before this change was that slower build.)
 [profile.diag]
 inherits = "release"
-lto = false
-codegen-units = 16
+lto = "thin"
+codegen-units = 1

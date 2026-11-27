@@ -1759,13 +1759,99 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// How long a partly-mapped answer stands, in milliseconds
+/// (`VICTORY_MAPPED_REASK=<frames>`, default 0: asked every pass, as before).
+///
+/// The pass over the heap's views asks every texture that is due how much of
+/// it is there, and a texture still streaming in stays due: 3 to 519 slots a
+/// frame in the title's first world minutes, each ask a kernel question for
+/// every 64 KiB block of the texture (`readable`). The stage ran 16.6 to
+/// 54.8 ms a frame on the submitting thread (runs 202-204).
+///
+/// A partly-mapped answer only grows while the title streams the texture in,
+/// so a kept one is never more than a few passes behind, and a slot behind is
+/// uploaded a few passes later. Zero and whole answers are never kept: zero
+/// means the texture has streamed out and must be seen to, and whole means
+/// the slot is done with.
+fn mapped_reask() -> u64 {
+    static KEEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| {
+        std::env::var_os("VICTORY_MAPPED_REASK")
+            .and_then(|v| v.to_str().and_then(|v| v.trim().parse::<u64>().ok()))
+            .filter(|n| *n > 0)
+            // The title's frame is 33.3 ms; a pass that runs long keeps its
+            // answers proportionally longer, which is what a frame count is
+            // meant to express.
+            .map(|frames| frames.saturating_mul(40))
+            .unwrap_or(0)
+    })
+}
+
+thread_local! {
+    /// `(at, len, mapped, when)` for the partly-mapped answers of this
+    /// thread's last passes. Linear scan from the back: a pass holds a few
+    /// hundred at most, and the scan is nothing beside a kernel walk.
+    static MAPPED_KEPT: std::cell::RefCell<Vec<(usize, usize, u64, std::time::Instant)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many of the asks were answered from the memo, and how many were put
+/// there (diagnostics).
+pub(crate) static MAPPED_MEMO: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// How many bytes of `[at, at + len)` are committed memory, kept for a few
+/// passes when the answer is a part of the texture ([`mapped_reask`]).
+pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
+    use std::sync::atomic::Ordering;
+    let keep = mapped_reask();
+    if keep == 0 || len == 0 {
+        return mapped_bytes_now(at, len);
+    }
+    let key = (at as usize, len);
+    let mut kept = None;
+    MAPPED_KEPT.with(|m| {
+        let mut m = m.borrow_mut();
+        let mut stale = None;
+        for (i, entry) in m.iter().enumerate().rev() {
+            if entry.0 == key.0 && entry.1 == key.1 {
+                if entry.3.elapsed().as_millis() as u64 <= keep {
+                    kept = Some(entry.2);
+                } else {
+                    stale = Some(i);
+                }
+                break;
+            }
+        }
+        if let Some(i) = stale {
+            m.swap_remove(i);
+        }
+    });
+    if let Some(v) = kept {
+        MAPPED_MEMO[0].fetch_add(1, Ordering::Relaxed);
+        return v;
+    }
+    let v = mapped_bytes_now(at, len);
+    if v > 0 && (v as usize) < len {
+        MAPPED_MEMO[1].fetch_add(1, Ordering::Relaxed);
+        MAPPED_KEPT.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() >= 8192 {
+                m.clear();
+            }
+            m.push((key.0, key.1, v, std::time::Instant::now()));
+        });
+    }
+    v
+}
+
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
 /// one not there. With neither the first nor the last page committed the
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
-pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
+fn mapped_bytes_now(at: *const u8, len: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
