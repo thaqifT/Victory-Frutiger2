@@ -109,6 +109,8 @@ mod upload;
 mod watch;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod wc;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -138,3 +140,5 @@ pub use watch::{
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };
+#[cfg(windows)]
+pub use wc::{title_memory_released, title_memory_reserved};

@@ -187,6 +187,11 @@ pub extern "system" fn XMemVirtualAlloc(
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
     note_protection(asked, kind, flags, at as usize, size);
+    // What the title asked for, before the runtime cleaned it: the
+    // write-combining bit is what `victory_gpu::wc` decides on (#868).
+    if !at.is_null() && kind & MEM_COMMIT == 0 {
+        victory_gpu::title_memory_reserved(at as usize, size, asked);
+    }
     at
 }
 
@@ -407,6 +412,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            victory_gpu::title_memory_released(address as usize);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -417,6 +423,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
             // (`XMemAllocDefault`).
             let _changing = victory_gpu::title_memory_remapping();
             victory_gpu::title_memory_freed(align, 0);
+            victory_gpu::title_memory_released(align);
             VirtualFree(align as *mut c_void, 0, MEM_RELEASE);
             return;
         }
@@ -2082,6 +2089,7 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
+        victory_gpu::title_memory_released(address as usize);
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }

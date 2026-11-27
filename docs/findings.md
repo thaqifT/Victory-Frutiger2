@@ -576,3 +576,55 @@ and the card:
 is while our own side is still working. That is the frame-overlap prize, and it
 is the one worth the most: it needs no new rendering, only submissions that
 leave while the next one is prepared.
+### The pipeline wait does bite, once (`gd15`)
+
+`gd14`'s 39 recording lines peaked at 0.1 ms waiting for pipelines, which made
+#1234 look like a no-op. `gd15` (the same A/B with the switch named) shows one
+window at **250.3 ms** -- and the per-second curve names the frame it belongs
+to: `t=178`, **1521.9 ms/frame, 0 draws**. Nothing drawn, a quarter of a second
+in pipeline waits, and the frame three times its own budget.
+
+So the shape is right: a pipeline that a worker has not made costs the whole
+frame's budget (500 ms, shared) and then does it again next frame. It is rare --
+one window in 39 -- but it is one of the 1+ second frames, and it is the one
+class of them that is entirely ours. `VICTORY_PIPELINE_WAIT_EVERY_FRAME=1` puts
+it back for comparison.
+
+The A/B phases cannot settle it either way: phase 3 (every-frame waits, 2,787
+draws, mean 205.4) against phase 4 (one-frame, 1,507 draws, mean 184.1) is
+0.0737 against 0.1222 ms a draw, but the phases drew different scenes. That is
+the same trap as `gd14`'s barriers; the per-window counter is the honest
+measure and it is quoted above.
+
+`gd15` itself: 0 first-chance, 0 unhandled, 0 device removed, 0 panicked, best
+31 fps, peak 21,299 MB.
+
+### Write-combining memory: what the title asks for
+
+`XMemVirtualAlloc` already logs what the title asked for, before the runtime
+cleans it. From `gd14`, the reservations that carry the console's
+write-combining bit (`0x400`):
+
+| protection | kind | flags | MB | at |
+|---|---|---|---|---|
+| `0x2404` | `0x203000` | `0x283` | 2,199 | `0xd49400000` |
+| `0x2404` | `0x42000` | `0x23` | 1,621 | `0xfa5600000` |
+| `0x42404` | `0x203000` | `0x283` | 0 | `0xdd2b00000` |
+
+3.8 GB. `0x2404` is `PAGE_READWRITE` (`0x4`) plus the GPU-read bit (`0x2000`)
+plus write-combining (`0x400`); `0x42404` adds `0x40000`. The runtime drops
+`0x400` -- Windows cannot map a view write-combining -- but the console's
+semantics are what the title was written against, and they are what decide
+whether a byte ever has to come back to the CPU.
+
+That is the whole premise of `fxeless` #868, and it is now in the tree as
+`crate::wc`: reservations are recorded with the protection the title asked for,
+a piece is skipped only when it lies **wholly inside one** such reservation (a
+card copy's aligned window can span several, some of them ordinary memory), and
+`VICTORY_SKIP_WC_BACK=1` leaves those pieces on the card instead of reading
+them back. `VICTORY_SKIP_WC_COMPARE=1` also leaves them out of the card's
+compare. Both are off by default, both are `VICTORY_AB`-able, and the frame
+line reports pieces and megabytes left behind per frame.
+
+The measured cost it is aimed at, from `gd14`: 13.6 ms to put 8.5 MB back,
+645 MB/s, against the 640 MB/s an uncached line costs at 64 B per ~100 ns.

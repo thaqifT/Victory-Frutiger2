@@ -9783,6 +9783,23 @@ impl Meter {
                     );
                     traffic::line(copy_stats_frames);
                     crate::copystat::log(copy_stats_frames);
+                    {
+                        // `crate::wc` (fxeless #868): pieces of write-combining
+                        // title memory left on the card rather than read back.
+                        let (pieces, bytes) = crate::wc::skipped();
+                        static LAST: [std::sync::atomic::AtomicU64; 2] =
+                            [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+                        let was = LAST[0].swap(pieces, Ordering::Relaxed);
+                        let was_bytes = LAST[1].swap(bytes, Ordering::Relaxed);
+                        if pieces > was {
+                            tracing::info!(
+                                "write-combining pieces left on the card per frame (VICTORY_SKIP_WC_BACK): {:.1} pieces, {:.1} MB not read back; {} MB in all, of {} reservations",
+                                (pieces - was) as f64 / frames,
+                                (bytes - was_bytes) as f64 / frames / 1e6,
+                                bytes >> 20,
+                                crate::wc::known()
+                            );                        }
+                    }
                     for (why, n) in drops.iter().take(40) {
                         tracing::info!(
                             "dropped {:.1}/frame without a host pipeline: {why}",

@@ -3448,6 +3448,13 @@ impl Shadow {
             // work for small ranges.
             let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
             for (at, n) in differing {
+                // A piece of write-combining title memory stays on the card
+                // (`crate::wc`, fxeless #868): reading it back costs what an
+                // uncached line costs, 645 MB/s measured, and the title's CPU
+                // is not expected to read memory it asked the GPU to write.
+                if crate::wc::skip_piece(start + at, n) {
+                    continue;
+                }
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
