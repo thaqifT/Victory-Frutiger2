@@ -181,6 +181,75 @@ fn taken(i: usize) -> u64 {
     COUNT.iter().map(|b| b.0[i].swap(0, Relaxed)).sum()
 }
 
+/// Copies by size, when `VICTORY_COPY_SPLIT=1`: whether the frame's copy time
+/// is many small copies (per-call cost, which joining would take out) or a few
+/// large ones (bandwidth, which nothing here can). Buckets of the length:
+/// 64 B, 256 B, 1 KiB, 4 KiB, 64 KiB, 1 MiB, and the rest.
+const SIZES: usize = 7;
+
+static SIZE_CALLS: [AtomicU64; SIZES] = [const { AtomicU64::new(0) }; SIZES];
+static SIZE_US: [AtomicU64; SIZES] = [const { AtomicU64::new(0) }; SIZES];
+static SIZE_BYTES: [AtomicU64; SIZES] = [const { AtomicU64::new(0) }; SIZES];
+
+fn sizes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_SPLIT").is_some())
+}
+
+/// One copy of `len` bytes that took `us` microseconds, in its bucket.
+pub(crate) fn moved(len: usize, us: u64) {
+    if !sizes_on() {
+        return;
+    }
+    let bucket = match len {
+        0..=64 => 0,
+        65..=256 => 1,
+        257..=1024 => 2,
+        1025..=4096 => 3,
+        4097..=65536 => 4,
+        65_537..=1_048_576 => 5,
+        _ => 6,
+    };
+    SIZE_CALLS[bucket].fetch_add(1, Relaxed);
+    SIZE_US[bucket].fetch_add(us, Relaxed);
+    SIZE_BYTES[bucket].fetch_add(len as u64, Relaxed);
+}
+
+/// [`moved`]'s buckets, per frame, taken.
+fn copy_sizes(frames: f64) {
+    const NAMES: [&str; SIZES] = ["<=64B", "<=256B", "<=1KiB", "<=4KiB", "<=64KiB", "<=1MiB", "bigger"];
+    let mut line = String::with_capacity(256);
+    let (mut calls, mut us, mut bytes) = (0u64, 0u64, 0u64);
+    for i in 0..SIZES {
+        let (c, u, b) = (
+            SIZE_CALLS[i].swap(0, Relaxed),
+            SIZE_US[i].swap(0, Relaxed),
+            SIZE_BYTES[i].swap(0, Relaxed),
+        );
+        calls += c;
+        us += u;
+        bytes += b;
+        if c == 0 {
+            continue;
+        }
+        use std::fmt::Write as _;
+        let _ = write!(line, "{}{} {:.0} {:.2} ms {:.1} MB", if line.is_empty() { "" } else { "; " }, NAMES[i], c as f64 / frames, u as f64 / frames / 1e3, b as f64 / frames / 1e6);
+    }
+    if calls == 0 {
+        return;
+    }
+    // The per-call cost and the rate are the two numbers that say which fix
+    // is the one: 1.8 us for 500 bytes is a call to fix, 40 GB/s is a wall.
+    tracing::info!(
+        "copies by size per frame: {line}; {:.0} calls, {:.2} ms, {:.1} MB, {:.0} ns a call, {:.1} GB/s",
+        calls as f64 / frames,
+        us as f64 / frames / 1e3,
+        bytes as f64 / frames / 1e6,
+        if calls > 0 { us as f64 * 1e3 / calls as f64 } else { 0.0 },
+        if us > 0 { bytes as f64 / us as f64 / 1e3 } else { 0.0 },
+    );
+}
+
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -1306,6 +1375,7 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexChanged as usize]),
         c[C::TexHot as usize],
     );
+    copy_sizes(frames);
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \

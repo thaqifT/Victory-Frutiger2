@@ -646,8 +646,18 @@ static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// pipeline library call that no line of the log tied to them.
 /// `VICTORY_TRAIL=0`: nothing is kept and nothing is said.
 static TRAIL: Mutex<std::collections::VecDeque<(u64, u32, String)>> = Mutex::new(std::collections::VecDeque::new());
-/// The entries kept.
-const TRAIL_MOST: usize = 96;
+/// The entries kept. A device is removed some 40-110 s after `late` starts
+/// (`VICTORY_LATE_WAIT`), at 30 submissions a frame and 4-7 frames a second:
+/// 96 entries held the last 0.6 s and the sweeps of idle staging buffers took
+/// most of those. 256 covers 1.7 s of submissions, and the sweeps have a ring
+/// of their own ([`TRAIL_SWEEPS`]) so they cannot evict them.
+const TRAIL_MOST: usize = 256;
+
+/// Routine churn that would otherwise fill [`TRAIL`]: staging buffers of
+/// textures let go, which happens on most submissions.
+static TRAIL_SWEEPS: Mutex<std::collections::VecDeque<(u64, String)>> = Mutex::new(std::collections::VecDeque::new());
+/// The sweeps kept.
+const SWEEP_MOST: usize = 16;
 
 fn trail_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -678,6 +688,20 @@ pub(crate) fn trail(what: impl FnOnce() -> String) {
         trail.pop_front();
     }
     trail.push_back(entry);
+}
+
+/// [`trail`] for routine churn ([`TRAIL_SWEEPS`]), which must not push the
+/// submissions out of the ring.
+pub(crate) fn trail_sweep(what: impl FnOnce() -> String) {
+    if !trail_on() {
+        return;
+    }
+    let entry = (now_us(), what());
+    let mut sweeps = TRAIL_SWEEPS.lock().unwrap_or_else(|e| e.into_inner());
+    if sweeps.len() >= SWEEP_MOST {
+        sweeps.pop_front();
+    }
+    sweeps.push_back(entry);
 }
 
 /// What the submitting thread is doing (0 nothing: between submissions,
@@ -718,6 +742,12 @@ pub(crate) fn removal_context() -> String {
     let _ = write!(text, "; the last {} things done, newest last:", trail.len());
     for (at, thread, what) in trail.iter() {
         let _ = write!(text, "\n  {:.1} ms before, thread {thread}: {what}", ms(*at));
+    }
+    drop(trail);
+    let sweeps = TRAIL_SWEEPS.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = write!(text, "; of the sweeps, the last {}:", sweeps.len());
+    for (at, what) in sweeps.iter() {
+        let _ = write!(text, "\n  {:.1} ms before: {what}", ms(*at));
     }
     text
 }
@@ -6070,6 +6100,7 @@ impl Host {
         submitting(2, runs.len());
         for (_i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
+            trail(|| format!("submission {} sent: {} lists, {} lists in this group, {} on the card before it", *submitted, runs.len(), group.len(), *submitted - 1));
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -6086,9 +6117,11 @@ impl Host {
                         working(false);
                         #[cfg(feature = "diagnostics")]
                         let _card = crate::timeline::card_wait(Some(*submitted));
+                        trail(|| format!("submission {} signalled, waiting for the card", *submitted));
                         WaitForSingleObject(self.event, INFINITE);
                         stood(started);
                         working(true);
+                        trail(|| format!("submission {} done, {} ms on the card", *submitted, started.elapsed().as_millis()));
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
@@ -6160,6 +6193,7 @@ impl Host {
             ));
         }
         submitting(3, runs.len());
+        trail(|| format!("submission {} copied back from the card: starting, {} ranges to title", this_submission, declared.len()));
         // Split into its parts: a timeline of the world's frames put 19 ms a
         // frame in this one span (tl1, 30 frames, mean 204.6 ms), and the
         // span held five different jobs.
@@ -6194,6 +6228,7 @@ impl Host {
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        trail(|| format!("submission {} copied back in {} ms", this_submission, copying.elapsed().as_millis()));
         stage.next("copying back: read-backs");
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
@@ -8906,7 +8941,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // mapping beside it is written when that is done.)
     let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+    {
+        let us = moved.elapsed().as_micros() as u64;
+        crate::copystat::add(crate::copystat::C::MoveUs, us);
+        crate::copystat::moved(len, us);
+    }
     if whole {
         return;
     }
