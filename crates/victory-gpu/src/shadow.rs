@@ -2156,9 +2156,11 @@ pub(crate) fn exact_back() -> bool {
 }
 
 /// Since the last frame-rate line: pieces put back by [`put_changed`], the
-/// writes they took, the bytes written, and the pieces whose runs were
-/// joined over bytes that had not changed.
-pub(crate) static PUT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// writes they took, the bytes written, the pieces whose runs were joined
+/// over bytes that had not changed, and the bytes of the stretches it was
+/// handed (title memory read to find what changed: the read is the cost,
+/// and it is an order of magnitude more than what is stored).
+pub(crate) static PUT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// The dwords (of title memory from `at` on) where `merged` differs from
 /// `title`, as (offset, bytes) in order, joined where at most `gap` bytes
@@ -2329,33 +2331,52 @@ fn under_wide() -> bool {
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
     crate::watch::landing(at, title.len());
+    PUT[4].fetch_add(merged.len() as u64, Ordering::Relaxed);
     if !exact_back() {
         crate::host::write_mapped(at as *mut u8, merged.as_ptr(), merged.len());
         return merged.len();
     }
     if crate::safecopy::on() {
-        PUT[0].fetch_add(1, Ordering::Relaxed);
-        PUT[2].fetch_add(merged.len() as u64, Ordering::Relaxed);
         let since = crate::watch::changes();
         // SAFETY: title memory; a page of it that is not there fails the
         // put, and the rest is put page by page.
-        if unsafe { crate::safecopy::put_changed(at as *mut u8, title, merged) } {
-            return merged.len();
-        }
-        let mut from = 0;
-        while from < merged.len() {
-            let n = (4096 - (at + from) % 4096).min(merged.len() - from);
-            let (was, now) = (&title[from..from + n], &merged[from..from + n]);
-            // SAFETY: as above.
-            let put = || unsafe { crate::safecopy::put_changed((at + from) as *mut u8, was, now) };
-            // A page that is away only while the runtime changes a mapping
-            // beside it gets its bytes when that is done.
-            if !put() && !crate::watch::again_after_change(since, put) {
-                crate::watch::lost("what shaders wrote", at + from, n);
+        let mut put = unsafe { crate::safecopy::put_changed(at as *mut u8, title, merged) };
+        if !put.there {
+            let mut total = crate::safecopy::Put { there: true, ..Default::default() };
+            let mut from = 0;
+            while from < merged.len() {
+                let n = (4096 - (at + from) % 4096).min(merged.len() - from);
+                let (was, now) = (&title[from..from + n], &merged[from..from + n]);
+                // SAFETY: as above.
+                let page = || unsafe { crate::safecopy::put_changed((at + from) as *mut u8, was, now) };
+                let mut done = page();
+                if !done.there {
+                    // A page that is away only while the runtime changes a
+                    // mapping beside it gets its bytes when that is done.
+                    let mut again = crate::safecopy::Put::default();
+                    if crate::watch::again_after_change(since, || {
+                        again = page();
+                        again.there
+                    }) {
+                        done = again;
+                    }
+                }
+                total.dwords += done.dwords;
+                total.blocks += done.blocks;
+                total.there &= done.there;
+                if !done.there {
+                    crate::watch::lost("what shaders wrote", at + from, n);
+                }
+                from += n;
             }
-            from += n;
+            put = total;
         }
-        return merged.len();
+        // What was stored, not the stretch handed over: the two differ by
+        // an order of magnitude, and the frame line said the stretch.
+        PUT[0].fetch_add(u64::from(put.dwords > 0), Ordering::Relaxed);
+        PUT[1].fetch_add(put.blocks, Ordering::Relaxed);
+        PUT[2].fetch_add(put.dwords * 4, Ordering::Relaxed);
+        return (put.dwords * 4) as usize;
     }
     let mut runs = dword_runs(at, title, merged, 0);
     if runs.len() > 64 {

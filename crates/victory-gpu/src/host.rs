@@ -9847,12 +9847,14 @@ impl Meter {
                              keeping what each shows, {textures:.1} ms uploading the textures they pick"
                         );
                     }
-                    let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                    let put = [0, 1, 2, 3, 4].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
                     tracing::info!(
-                        "what shaders wrote put into title memory per frame (VICTORY_EXACT_BACK): {:.0} pieces in {:.0} writes, {:.1} MB; {:.0} pieces joined over gaps",
+                        "what shaders wrote put into title memory per frame (VICTORY_EXACT_BACK): {:.0} pieces in {:.0} writes, \
+                         {:.1} MB stored of {:.1} MB of title memory read to find it; {:.0} pieces joined over gaps",
                         put[0],
                         put[1],
                         put[2] / 1e6,
+                        put[4] / 1e6,
                         put[3]
                     );
                     traffic::line(copy_stats_frames);

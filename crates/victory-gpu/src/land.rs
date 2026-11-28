@@ -155,7 +155,11 @@ pub(crate) fn log(frames: f64) {
         );
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-    if s[stat::PIECES] == 0.0 && s[stat::REST] == 0.0 {
+    // Every counter, not two of them: the line was skipped whenever no piece
+    // went through [`piece`] even though the times beside it were recorded,
+    // so a run whose landings all took the relay's road said nothing at all
+    // about where its landing time went.
+    if s.iter().all(|v| *v == 0.0) {
         return;
     }
     let ms = |i: usize| s[i] / 1000.0;

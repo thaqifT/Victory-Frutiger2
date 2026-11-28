@@ -1701,3 +1701,46 @@ one frame per log for months: it assigned its rows to `$a`, and PowerShell is
 case-insensitive, so `$a` was the `[string]$A` path parameter and the array was
 coerced to one string. Both are fixed here; the tables above are the first
 readings that tool has actually produced.
+
+## What putting back actually costs: 100.6 MB read to store 60.7 MB, and the pool that would have helped never runs
+
+The frame line has said `copying back 33.7 ms 39.9 MB` for a while, and the
+landing line has said `4,476 pieces in 0 writes, 179.2 MB`. Both were wrong in
+the same direction -- they reported the *stretch of title memory handed to
+`put_changed`*, not the bytes actually stored into it. A put of a 64 KiB piece
+whose card wrote one dword reports 64 KiB. That is the read, not the write, and
+the two differ by an order of magnitude.
+
+`victory_safe_put` now counts as it goes (`safecopy.rs`): blocks of 32 bytes
+with any differing dword, and dwords stored, into a fifth argument; the fault
+exit zeroes both so a put that failed part way is not counted as bytes in.
+`put_changed` returns `Put { there, blocks, dwords }`, `PUT` is five counters
+wide, and the frame line reads:
+
+```text
+what shaders wrote put into title memory per frame (VICTORY_EXACT_BACK):
+3194 pieces in 2025272 writes, 60.7 MB stored of 100.6 MB of title memory read
+to find it; 0 pieces joined over gaps
+```
+
+and on a lighter stretch of the same run, `1081 pieces in 302440 writes, 7.9 MB
+stored of 21.4 MB of title memory read`. `put1`, before the counter, printed
+`10703 pieces in 5692175 writes, 169.3 MB` and `1242 pieces in 397559 writes,
+11.3 MB` -- those are stretches too, so the stored figures were smaller still.
+
+**Two facts this settles about the landing path.**
+
+The parallel merge pool never runs. `land::piece` and `land::piece_at` are
+reached only from `HostList::merge` (`host.rs:3801`), which is the relay's road,
+and the relay is off. In the default waited path every piece is
+`Shadow::copy_back_with` on the submitting thread. `C::BackSyncUs` is bumped at
+exactly one place, `shadow.rs:3488`, inside `copy_back_with` -- which is the
+confirmation: "putting them back" is serial, on the thread that is also
+preparing the next frame.
+
+And the cost is dominated by reading title memory, not by writing it. A put is
+handed the whole `first..last` stretch of a piece and reads all of it to find
+which dwords differ; it stores 60 % of that. `safecopy::merge` already does the
+other thing -- reads 32 bytes at a time and only where `now != held` -- which is
+what the relay path would have used. That is the next lever to try, behind a
+switch, A/B'd on `prep`/`back` at matched draw counts.

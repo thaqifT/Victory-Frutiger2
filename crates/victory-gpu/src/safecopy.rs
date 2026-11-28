@@ -44,9 +44,14 @@ std::arch::global_asm!(
     ".globl victory_safe_put_after",
     ".globl victory_safe_put_failed",
     // rcx destination, rdx what was there, r8 what is to be there, r9 blocks
-    // of eight dwords: stores the dwords in which the two differ, and no
-    // other byte. eax: whether all could be stored.
+    // of eight dwords, fifth where the counts go (two qwords, zeroed by the
+    // caller): stores the dwords in which the two differ, and no other byte.
+    // eax: whether all could be stored. The counts: blocks of 32 bytes
+    // anything was stored in, and dwords stored. A fault clears them, so a
+    // put that failed part way is not counted as bytes in.
     "victory_safe_put:",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
     "test r9, r9",
     "jz 4f",
     "vpcmpeqd ymm3, ymm3, ymm3",
@@ -56,6 +61,10 @@ std::arch::global_asm!(
     "vmovmskps eax, ymm2",
     "cmp eax, 255",
     "je 3f",
+    "inc r10",
+    "xor eax, 255",
+    "popcnt eax, eax",
+    "add r11, rax",
     "vpxor ymm2, ymm2, ymm3",
     "victory_safe_put_at:",
     "vpmaskmovd ymmword ptr [rcx], ymm2, ymm1",
@@ -69,10 +78,16 @@ std::arch::global_asm!(
     "jnz 2b",
     "vzeroupper",
     "4:",
+    "mov rax, qword ptr [rsp + 40]",
+    "mov qword ptr [rax], r10",
+    "mov qword ptr [rax + 8], r11",
     "mov eax, 1",
     "ret",
     "victory_safe_put_failed:",
     "vzeroupper",
+    "mov rax, qword ptr [rsp + 40]",
+    "mov qword ptr [rax], 0",
+    "mov qword ptr [rax + 8], 0",
     "xor eax, eax",
     "ret",
     ".globl victory_safe_merge",
@@ -178,7 +193,7 @@ unsafe extern "system" {
     fn victory_safe_copy_at();
     fn victory_safe_copy_after();
     fn victory_safe_copy_failed();
-    fn victory_safe_put(dst: *mut u8, was: *const u8, now: *const u8, blocks: usize) -> u32;
+    fn victory_safe_put(dst: *mut u8, was: *const u8, now: *const u8, blocks: usize, counts: *mut [u64; 2]) -> u32;
     fn victory_safe_put_at();
     fn victory_safe_put_after();
     fn victory_safe_put_failed();
@@ -337,27 +352,45 @@ pub(crate) unsafe fn differ(a: *const u8, b: *const u8, len: usize) -> bool {
     (len / 32 * 32..len).any(|i| unsafe { a.add(i).read_volatile() != b.add(i).read_volatile() })
 }
 
+/// What [`put_changed`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Put {
+    /// Whether every page of the destination could be written.
+    pub(crate) there: bool,
+    /// Blocks of 32 bytes anything was stored in.
+    pub(crate) blocks: u64,
+    /// Dwords stored. The bytes put into title memory are four times this;
+    /// the stretch handed over is usually far more, and saying the stretch
+    /// was put is what made the frame line read "4,476 pieces in 0 writes,
+    /// 179.2 MB".
+    pub(crate) dwords: u64,
+}
+
 /// Puts `now` at `dst` where it differs from `was`, whole dwords (as `dst`
 /// is aligned) and not a byte beside them: other threads may be writing
 /// those. At the ends, single bytes of a dword only partly in the stretch.
-/// False if a page could not be written; then some may have been.
+/// A page that could not be written says so in [`Put::there`]; then some
+/// may have been, and none of them is counted.
 ///
 /// # Safety
 /// As [`copy`]'s.
-pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
+pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> Put {
     assert_eq!(was.len(), now.len());
     let n = now.len();
     let head = dst.addr().wrapping_neg() & 3;
     let head = head.min(n);
     let blocks = (n - head) / 32;
     let tail = head + blocks * 32;
-    let mut all = true;
+    let mut out = Put { there: true, ..Put::default() };
     if blocks > 0 {
+        let mut counts = [0u64; 2];
         // SAFETY: the two slices hold the blocks; the destination's faults
         // leave through the failing exit.
-        all &= unsafe { victory_safe_put(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks) != 0 };
+        out.there = unsafe { victory_safe_put(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks, &mut counts) != 0 };
+        out.blocks = counts[0];
+        out.dwords = counts[1];
     }
-    let single = |from: usize, to: usize| {
+    let single = |from: usize, to: usize, out: &mut Put| {
         let mut all = true;
         let mut i = from;
         while i < to {
@@ -366,14 +399,16 @@ pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
             if was[i..i + len] != now[i..i + len] {
                 // SAFETY: inside the stretch.
                 all &= unsafe { copy(dst.add(i), now[i..].as_ptr(), len) };
+                out.dwords += 1;
             }
             i += len;
         }
         all
     };
-    all &= single(0, head);
-    all &= single(tail, n);
-    all
+    let front = single(0, head, &mut out);
+    let back = single(tail, n, &mut out);
+    out.there &= front && back;
+    out
 }
 
 /// Whether copies are made here and not by the kernel.
@@ -531,7 +566,7 @@ mod tests {
                     // SAFETY: inside the allocation.
                     unsafe {
                         std::ptr::write_bytes(pages.0, 0xC3, pages.1);
-                        assert!(put_changed(pages.0.add(at), &was, &now));
+                        assert!(put_changed(pages.0.add(at), &was, &now).there);
                         let there = std::slice::from_raw_parts(pages.0, pages.1);
                         let base = pages.0.addr();
                         for (k, &byte) in there.iter().enumerate() {
@@ -557,13 +592,58 @@ mod tests {
         unsafe {
             VirtualFree(pages.0.add(4096).cast(), 4096, MEM_DECOMMIT);
             let (was, now) = (vec![0u8; 8192], vec![1u8; 8192]);
-            assert!(!put_changed(pages.0, &was, &now));
+            assert!(!put_changed(pages.0, &was, &now).there);
             // Nothing differs on the page that is not there: nothing fails.
             let mut now = was.clone();
             now[0] = 1;
-            assert!(put_changed(pages.0, &was, &now));
+            assert!(put_changed(pages.0, &was, &now).there);
         }
     }
+
+    /// The counts a put reports are what it stored: blocks of 32 bytes with
+    /// a differing dword in them, and the dwords themselves -- not the
+    /// stretch it was handed. (The frame line read "4,476 pieces in 0
+    /// writes, 179.2 MB" because the stretch was reported and nothing
+    /// counted the writes.)
+    #[test]
+    fn a_put_reports_what_it_stored() {
+        assert!(on());
+        let pages = Pages::new(3 << 12);
+        let base = pages.0.addr();
+        for at in [0usize, 1, 2, 3, 4, 13, 4090] {
+            for len in [0usize, 1, 3, 4, 5, 31, 32, 33, 64, 100, 1000, 4096] {
+                let was: Vec<u8> = (0..len).map(|i| (i * 13 + 1) as u8).collect();
+                for step in [1usize, 5, 17, 64, 10_000] {
+                    let mut now = was.clone();
+                    for i in (0..len).step_by(step) {
+                        now[i] ^= 0x5A;
+                    }
+                    // A dword whose bytes differ in the stretch, counted
+                    // once however many of its bytes do.
+                    let mut dwords: Vec<usize> =
+                        (0..len).filter(|&i| now[i] != was[i]).map(|i| (base + at + i) / 4).collect();
+                    dwords.dedup();
+                    // The put stores whole blocks from the first dword of the
+                    // stretch on; the bytes of a dword it starts in are its
+                    // ends', one by one.
+                    let head = ((base + at).wrapping_neg() & 3).min(len);
+                    let blocks = (len - head) / 32;
+                    let with_a_dword = (0..blocks)
+                        .filter(|b| {
+                            let from = (base + at + head + b * 32) / 4;
+                            (from..from + 8).any(|d| dwords.binary_search(&d).is_ok())
+                        })
+                        .count();
+                    // SAFETY: inside the allocation.
+                    let put = unsafe { put_changed(pages.0.add(at), &was, &now) };
+                    assert!(put.there, "at {at} len {len} step {step}");
+                    assert_eq!(put.dwords as usize, dwords.len(), "dwords at {at} len {len} step {step}");
+                    assert_eq!(put.blocks as usize, with_a_dword, "blocks at {at} len {len} step {step}");
+                }
+            }
+        }
+    }
+
 
     /// [`merge`] against what it is to do, byte by byte, for every kind of
     /// start, end and change: the bytes the card changed arrive in title
@@ -883,7 +963,7 @@ mod tests {
         let at = pages.0.addr() + 4096;
         let (was, now) = (vec![0u8; 4096], vec![0x5Au8; 4096]);
         // SAFETY: as above; every dword differs, so every block is written.
-        assert!(!unsafe { put_changed(at as *mut u8, &was, &now) });
+        assert!(!unsafe { put_changed(at as *mut u8, &was, &now) }.there);
         assert!(guarded(at), "the put's fault cleared the guard flag");
     }
 
