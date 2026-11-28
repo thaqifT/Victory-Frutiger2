@@ -1827,3 +1827,89 @@ at a thousand draws, and even deleting all of it leaves 82 ms. That is the
 honest number, and it is why every lever tried so far -- overlap, refresh
 cadence, resolution, console profile, buffer sizes, ask spreading -- has
 measured flat or worse.
+## The card's clock: the frame is an alternation, and both halves are measured
+
+The frame line has carried `card_clock_line` (`host.rs:869`, called
+unconditionally from `meter_lines`) for a while, and it was never read: a
+grep for "card clock" missed it because the line says "the card's clock".
+`VICTORY_CARD_CLOCK` does not exist -- there is no switch, the numbers are
+in every run.
+
+`CARD_CLOCK_US` is a fence of the clock's own, signalled behind every send
+of lists (`Host::card_sent`, `host.rs:4440`). A thread waits for the newest
+signal and notes the moment the card reached it with nothing newer behind
+it; the next send ends that idle stretch. So `idle` is the microseconds the
+queue had nothing of ours, and `behind` is the part of that during which the
+thread that holds the submission lock was *working* (`WORKING`,
+`host.rs:797`).
+
+`mskip` (diag, 175 s, world), the last five lines:
+
+```
+nothing of ours queued 81.2 ms (the card about 51% busy), 76.1 ms of that while
+  the submitting thread was working, the rest while the title had not submitted;
+  the submitting thread stood waiting for the card 86.0 ms
+nothing of ours queued 96.6 ms (46% busy), 91.4 ms of that while working, stood 81.9 ms
+nothing of ours queued 98.1 ms (47% busy), 92.1 ms of that while working, stood 88.8 ms
+nothing of ours queued 89.1 ms (52% busy), 83.9 ms of that while working, stood 96.5 ms
+nothing of ours queued 77.7 ms (52% busy), 72.6 ms of that while working, stood 84.1 ms
+```
+
+`77.7 + 84.1 = 161.8` -- the frame line's own 160-162 ms. **Every
+millisecond of the frame is either "the card has nothing of ours" or "the
+submitting thread is standing on the fence".** There is no third state and
+no slack: the frame is a strict alternation, and the two halves are almost
+equal.
+
+The frame account agrees from the other side:
+
+```
+thread 23324 submitted 30.1x/frame: between its submissions 5.3 ms (running
+  0.0 ms user + 0.5 ms kernel; 0.0 ms in list calls), in them running
+  56.2 ms user + 14.2 ms kernel, 0.4 ms waiting for the submission lock
+```
+
+70.4 ms of CPU on the submitting thread against 72.6 ms of card idle behind
+it -- the same number twice. And the card is genuinely executing, not
+stalling on turnaround: 30.1 submissions a frame, the card about 52 per
+cent busy, and `gt2`'s per-command timestamps (indirect 47.1 ms, dispatch
+28.8, draw 5.4) add to the 84 ms the clock sees. **The GPU column of the
+draw-band table is real card time**, which is what the 30 fps floor argument
+needed and did not have.
+
+The 616 ms user + 184 ms kernel the process spends a frame on all threads
+is not the critical path: the six recording threads are 182 ms together and
+parallel. One thread's 70.4 ms and the card's 84 ms are the frame.
+
+So a frame is `70.4 (us) + 84 (card)`. 30 fps is 33 ms. Both halves would
+have to come down by more than half at once, and the card half is the
+title's own meshlet and culling compute. That is the closed case for 30 fps
+in the world, stated in the one measurement that could have broken it.
+
+## What the refresh is actually spending: 13.5 GB of ranges a frame
+
+The same run's copy line:
+
+```
+copies per frame: 30.1 submissions; 6465 title copies 4.4 MB;
+13565 refreshes 13497.9 MB, 0 skipped 0.0 MB; 228 runs 0.0 ms;
+0 queries 0.00 ms, moves 36.10 ms, 17.89 MB unmapped; 12702 page faults;
+678 watches 62.06 ms, 10139.9 MB checked, 10003.5 MB unchanged;
+93.3 fallbacks; 597 guard faults
+```
+
+**13.5 GB of host-copy ranges are refreshed every frame and 10.0 GB of
+them are unchanged.** The copy itself is nothing (4.4 MB of title copies);
+the cost is asking about 13.5 GB, and `watches 62.06 ms` is the kernel and
+guard asking that cannot be avoided for ranges the journal does not already
+hold.
+
+`Shadow::nothing_new` and `Shadow::copy_stale`'s `ranged` note already skip
+the *copy* of a range taken whole and unwritten since. What they did not
+skip was the page walk that finds out. `copy_stale` now returns before the
+walk when `ranged != 0` and no page of the range was written after it --
+which is exactly "the range was taken whole and nothing touched it", the
+case the walk then discovers for itself at one iteration per 64 KiB page.
+`SKIPPED` counts the ranges and bytes it skips, printed as
+`refreshes skipped whole per frame` when it fires, so the next run says
+whether this tail is worth anything.

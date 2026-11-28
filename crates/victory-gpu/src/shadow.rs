@@ -1811,6 +1811,15 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    let [skipped, skipped_bytes] = [0, 1].map(|i| SKIPPED[i].swap(0, Ordering::Relaxed));
+    if skipped > 0 {
+        tracing::info!(
+            "refreshes skipped whole per frame: {:.0} ranges, {:.1} MB of them, taken whole before and not written since \
+             (their pages were not walked)",
+            skipped as f64 / frames,
+            skipped_bytes as f64 / (1 << 20) as f64 / frames
+        );
+    }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -2161,6 +2170,11 @@ pub(crate) fn exact_back() -> bool {
 /// handed (title memory read to find what changed: the read is the cost,
 /// and it is an order of magnitude more than what is stored).
 pub(crate) static PUT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Since the last frame-rate line: ranges a refresh of a host copy would
+/// have walked page by page to find nothing to copy, and the bytes of them:
+/// what [`copy_stale`] now skips without the walk.
+static SKIPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The dwords (of title memory from `at` on) where `merged` differs from
 /// `title`, as (offset, bytes) in order, joined where at most `gap` bytes
@@ -4276,17 +4290,39 @@ impl Shadow {
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
         // Pages the range holds in part are never noted in `copied`, and
         // were copied again at every refresh of the range, written or not:
         // of the heap's buffer views alone two ends for each of 4,400
         // copies, every frame. A range that was taken whole, and not written
         // since, is as it was.
         let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
+        // And every page of such a range is as it was, so the walk below
+        // would find no page to copy and none to note: it is not walked.
+        // The world refreshes 13.5 GB of ranges a frame, 9,876 MB of it
+        // unchanged (run mskip); the asking that gets here has already paid
+        // the kernel call, and this is the rest of it. `written` is the
+        // range's pages only (`watch::writes` cuts it to them), so an entry
+        // at or before `ranged` is one the range was taken whole after.
+        if ranged != 0 && written.iter().all(|&(_, write)| write <= ranged) {
+            SKIPPED[0].fetch_add(1, Ordering::Relaxed);
+            SKIPPED[1].fetch_add((to - from) as u64, Ordering::Relaxed);
+            // The same note the walk would leave: all of it is in the copy
+            // as of this asking (nothing of `copied` changes for a page
+            // that is not stale).
+            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+            ranged[0] = (from, to, now);
+            if to - from >= ranged[1].1 - ranged[1].0 {
+                ranged[1] = (from, to, now);
+            }
+            return 0;
+        }
+        let mut writes = written.iter().peekable();
         let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
         // Pages taken before and written since: in the order of their runs.
         let mut again_at: Vec<(usize, u64)> = Vec::new();
         let last = (to - 1) / PAGE;
+        // The copy's own bounds: they do not change inside the walk.
+        let (buf_start, buf_end) = (self.start as usize, (self.start + self.len) as usize);
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -4300,8 +4336,7 @@ impl Shadow {
             if taken == 0 || write > taken {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                if (page * PAGE).max(buf_start) >= from && ((page + 1) * PAGE).min(buf_end) <= to {
                     *at = now;
                 }
                 // Cut where pages taken before meet pages never taken.
