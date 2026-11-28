@@ -190,11 +190,13 @@ pub(crate) fn skip_piece(at: usize, n: usize) -> bool {
 }
 
 /// The experiment's running total, for the frame line: pieces and bytes.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn skipped() -> (u64, u64) {
     (SKIPPED[0].load(Ordering::Relaxed), SKIPPED[1].load(Ordering::Relaxed))
 }
 
 /// How many reservations are known, for the log line at start-up.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn known() -> usize {
     RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).len()
 }

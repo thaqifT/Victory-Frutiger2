@@ -1,2 +1,13 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# The suite's tests of `victory-gpu` share process-global state keyed by
+# address -- `watch`'s `PROTECTED`/`VIEWS` and its journal, `shadow`'s
+# `BUFFERS`/`LOOSE`, `inplace`'s `VIEWS`, `descriptor`'s copies. A test
+# allocates memory, and another test's memory was at that address before it:
+# run in parallel the two see each other's notes and about one run in five
+# fails on a bit that belongs to neither. Serial, the same tests pass. Opt
+# back in with `RUST_TEST_THREADS=16 cargo test` when working on a module of
+# its own.
+[env]
+RUST_TEST_THREADS = "1"

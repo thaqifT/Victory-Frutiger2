@@ -8589,7 +8589,6 @@ fn wide_textures() -> bool {
 /// whatever it carries, and the copies of one flush share a handful of
 /// shadows' locks, so the threads end up waiting on those.
 fn flush_wide() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
     let default_on = || std::env::var_os("VICTORY_FLUSH_WIDE").is_none_or(|v| v != "0");
     #[cfg(feature = "diagnostics")]
     let on = crate::ab::pick("VICTORY_FLUSH_WIDE").unwrap_or_else(default_on);

@@ -5336,6 +5336,30 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
 }
 
+/// What [`BUFFERS`] and [`LOOSE`] hold that covers any of `[at, at + len)`,
+/// as (start, bytes, is a window). Both tables are keyed by address and
+/// outlive the memory they were noted for, so a test that wants memory of
+/// its own with no copy of it asks here first.
+#[cfg(test)]
+pub(crate) fn copies_here(at: u64, len: u64) -> Vec<(u64, u64, bool)> {
+    let end = at.saturating_add(len);
+    let mut found: Vec<(u64, u64, bool)> = buffers_read()
+        .range(..(end, 0))
+        .rev()
+        .take(256)
+        .filter(|(_, e)| e.end > at)
+        .map(|(k, e)| (k.0, e.end - k.0, false))
+        .collect();
+    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    found.extend(
+        loose
+            .keys()
+            .filter(|(start, bytes)| *start < end && start + bytes > at)
+            .map(|&(start, bytes)| (start, bytes, true)),
+    );
+    found
+}
+
 /// The title buffer holding `address`, as (start, length), without making
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]

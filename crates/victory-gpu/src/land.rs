@@ -130,6 +130,7 @@ pub(crate) fn count(which: usize, n: u64) {
 
 /// One counter as it stands (`crate::land::stat`), for tests that need to
 /// say what a landing left out.
+#[cfg(test)]
 pub(crate) fn stat_of(which: usize) -> u64 {
     STATS[which].load(Ordering::Relaxed)
 }

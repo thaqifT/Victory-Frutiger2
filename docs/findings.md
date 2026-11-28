@@ -1345,3 +1345,74 @@ The walk itself is small: 40 MB ranges are 640 blocks, ten words of the
 other views of the page) and 736 `VirtualProtect` calls, not a scan over
 gigabytes. The 8,990-12,833 MB that `copystat` reports as "checked" is the
 range the askings cover, not memory that is walked.
+
+## The whole frame on a timeline, and where the scheduler sits (`tl-fl`)
+
+`VICTORY_TIMELINE=120,8,E:\GTA6_Frutiger\tl-fl.json` at shipped defaults, in
+the world: eight frames of 145.3 ms, 81,668 events. Per frame, by cause, the
+chain each present came out of:
+
+```text
+    50.04 ms  the card running submissions
+    15.57 ms  the title's CopyPageMappings
+     8.58 ms  woken, not running yet
+     7.07 ms  a job for another thread
+     5.09 ms  work spread over threads
+     4.21 ms  sent, the card not started yet
+     4.08 ms  copying back: into title memory
+     3.77 ms  streaming: a request
+     3.45 ms  outside our spans on 11084
+     3.32 ms  a wait nobody seen here ended (WaitForSingleObject)
+     3.17 ms  kernel: GetWriteWatch
+     2.68 ms  submit: the lists' steps
+     2.62 ms  a long list call
+     2.50 ms  a copy's refresh
+     2.39 ms  resetting a host list
+     2.20 ms  submit: sending
+     1.80 ms  beside: the heap's views
+     1.74 ms  outside our spans on 23028
+     1.67 ms  a texture's refresh
+     1.49 ms  asking: ahead
+     1.36 ms  the title's Present
+```
+
+Three things it settles.
+
+**The frame is CPU-bound, and the card is idle most of it.** 50.04 ms of 145.3
+is the card running our submissions; the other 95 is threads. That is §"The
+frame is preparing, then the card, then the copy back" read from the other
+side, and it is the reason tuning the card's work does not move the frame.
+
+**The title's own page mapping is the largest single CPU item, and it is our
+lock.** `CopyPageMappings` is 15.57 ms of the title's thread, and §"the guard
+machinery" has 30 ms of every frame waiting on the same `GUARDS` write lock
+that mapping queues behind. Those are one cost seen twice: the mapping is not
+slow in itself, it stands in the queue our `VirtualProtect` work makes.
+
+**20.7 ms of the frame is threads woken and not running** (8.58 woken, 7.07 a
+job handed to another thread, 5.09 work spread over threads). This is not
+saturation: the thread table sums to about 690 thread-ms a frame against
+2,320 available on eight cores with SMT, so the machine is 30 % busy. It is
+wake-up latency, and part of it is the instrument: `victory-sample`, the
+timeline's own sampling thread, **ran 134.1 ms of every 145.3 ms frame** --
+one core held for the whole run. These figures carry their own overhead and
+should be read as an upper bound on the scheduler's share.
+
+### The processor pinning does nothing on this machine
+
+`cores.rs` picks the fast processors two ways: by efficiency class, and, where
+every class is alike, by the largest last-level cache. A Ryzen 7 5800X
+reports one class and one 32 MB L3 shared by all eight cores, so `fast_by_class`
+and `fast_by_cache` both answer empty, `ask` returns before it opens a thread,
+and `settle` is never reached. `VICTORY_FAST_CORES` and `VICTORY_LANE_CORE` are
+no-ops here; both are for the 7900X3D/7950X3D class of part. Worth knowing
+before reading a run as evidence for or against them.
+
+### A texture's refresh is 1.67 ms of the chain, not 45
+
+The `texture refreshes per frame, all threads: 45 ms` line is
+`REFRESH_WAITS[3]`, summed over **every thread and every texture**, and the
+same span on the chain is 1.67 ms. The 25-56 ms is real CPU, but it is spread
+over the wide threads and lands beside the frame rather than in it. It is not
+the lever the all-threads figure suggests, and the guard work above
+(`VICTORY_TEXTURE_GUARD`, `HASH_EVERY = 8`) is already what keeps it there.

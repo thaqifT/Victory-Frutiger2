@@ -5550,6 +5550,10 @@ mod tests {
         assert!(!off_elements(112, 56, false, 0, false));
     }
 
+    /// The bytes of the heap [`views_off_their_elements_get_a_copy_of_their_bytes`]
+    /// asks about, rounded up: what it wants free of other tests' notes.
+    const VIEW_BYTES: u64 = 2048;
+
     /// Such a view is made on a copy of its own bytes, and that copy is the one
     /// brought up to date for it; another's is its buffer's.
     #[test]
@@ -5558,7 +5562,22 @@ mod tests {
             return; // no host GPU here
         };
         let memory = vec![0u64; 1 << 13];
-        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // A page of this heap with no title buffer noted over it. `shadow`'s
+        // tables are keyed by address and outlive the memory they were noted
+        // for, so a test that ran before this one can leave a buffer of its
+        // own over the pages this one is handed: `find` then answers with
+        // that buffer's copy, whose span and width are not this test's to
+        // expect, and one run in five failed there. A window outside buffers
+        // is no trouble: the copy it gives is the ask's own bytes, which is
+        // what is expected here. Every page of the heap is looked at.
+        let base = memory.as_ptr() as u64;
+        let end = base + memory.len() as u64 * 8;
+        let first = base.next_multiple_of(4096);
+        let start = (0..)
+            .map(|page| first + page * 4096)
+            .take_while(|&at| at + VIEW_BYTES <= end)
+            .find(|&at| crate::shadow::copies_here(at, VIEW_BYTES).iter().all(|&(_, _, window)| window))
+            .unwrap_or(first);
         // SAFETY: a plain CPU-side heap of one view.
         let cpu: ID3D12DescriptorHeap = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
