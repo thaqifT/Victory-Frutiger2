@@ -1594,3 +1594,110 @@ are, and they are 10 to 14 GB of page-table walk a frame.
 That closes the last of the "make the asking cheaper" levers on the copy path.
 The two that remain are the ones this file already names: ask less often, or
 ask over less. Neither is a tuning knob; both change what the copy guarantees.
+
+### Series S is not a faster console, and the card is idle half of every frame (`ss1`/`sx1`/`gt2`)
+
+Three runs, all `diag`, all at 1920x1080, all with the same knob table:
+
+- `ss1` -- `--console series-s`, 520 s, 94 frame lines
+- `sx1` -- `--console series-x`, 354 s (the title exited on its own), 63 frame lines
+- `gt2` -- `series-x` with `VICTORY_GPU_TIMING=1 VICTORY_D3D12_DRED=1`, 230 s
+
+**Series S against Series X: no reading either way.** `concompare.ps1` on
+`log-sx1.err.txt` against `log-ss1.err.txt`, banded by draw count so that the
+scene does not carry the answer:
+
+```text
+draws          nA   nB     ms A     ms B       x   prep A   prep B       x    gpu A   gpu B copies A copies B
+1000-1499       5   10    201.6    221.2    1.10     46.3     62.0    1.34     76.0    87.6     22.3     26.6
+1500-1999       7   13    243.8    203.2    0.83     46.7     55.9    1.20     80.0    95.9     23.0     28.0
+2000-2499       4    3    183.3    226.8    1.24     48.7     69.2    1.42     87.8   108.0     22.9     35.8
+2500-2999       6    9    248.0    224.6    0.91     60.7     57.3    0.94     96.6   101.0     30.8     26.6
+3000-3499       6    5    448.4    231.2    0.52     59.0     54.7    0.93     94.7   107.1     28.2     25.3
+3500-3999       3   17    208.2    225.0    1.08     53.7     53.7    1.00    100.7   105.5     25.6     25.4
+4000-4499       4   16    224.8    210.6    0.94     54.4     53.3    0.98    108.4   108.5     25.6     25.5
+4500-4999       1    7    335.0    239.1    0.71     63.7     56.2    0.88    109.7   117.5     33.9     25.9
+5000-5499       2    1    248.2    265.5    1.07     53.9     60.6    1.13    110.5   127.3     26.3     28.5
+5500-5999       2    1    233.4    332.6    1.43     58.1    110.6    1.90    122.7   134.3     29.4     67.3
+```
+
+The ratio column runs from 0.52 to 1.43 across the bands with one or two frames
+in several of them. The whole-run means are 280.9 ms a frame at 2,786 draws for
+Series X against 221.7 ms at 3,149 draws for Series S -- the smaller console
+posted the *lower* frame time at the *higher* draw count, which is not a
+result, it is noise. Every bucket that has frames in both runs shows the two
+consoles inside 20 per cent of each other on `gpu` (76-122 ms against 88-134).
+**The console profile changes nothing measurable about the frame.** That is the
+same answer mandy reached from the other side: their `d3d12/docs/findings.md`
+lists "Series S profile, smaller textures, a second drawing queue, `ASYNC_SUBMIT`
+off" under "Measured and not worth it", against their own README's claim that
+Series S is much faster than Series X. Both trees agree; the README does not.
+
+**The card is idle for about a third of every frame, behind our own CPU work.**
+The line that says so is printed every few seconds and had not been read:
+
+```text
+the card's clock per frame: nothing of ours queued 91.9 ms (the card about 54% busy
+by this count), 81.9 ms of that while the submitting thread was working (the card idle
+behind us), the rest while the title had not submitted; the submitting thread stood
+waiting for the card 111.6 ms
+```
+
+and on the two lines after it, `99.5 ms / 52 % / 88.3 ms / 110.9 ms` and
+`94.4 ms / 52 % / 84.1 ms / 104.6 ms`. So of a 210-250 ms frame the card runs
+about 110 ms, stands idle about 90 ms, and **84-88 ms of that idle is while the
+submitting thread is preparing and copying back** -- not while the title is
+between submissions. The frame is not card-bound and it is not title-bound: it
+is the serial relay, exactly as `host.rs` says at the top of the file ("every
+submission is waited for, so CPU and GPU never overlap"). Overlapping them is
+worth about 40 per cent of the frame, and the only two mechanisms in the tree
+for it are `VICTORY_LATE_WAIT` and `VICTORY_RELAY`, both closed by measurement
+because they wedge or strobe the card.
+
+**Where the card's 110-140 ms actually goes** (`gt2`, timing run). With
+`VICTORY_GPU_TIMING=1` each list runs and is timed on its own, so the totals are
+upper bounds -- the per-list figures carry a serialisation cost that the real
+path does not -- but the *shape* is sound:
+
+```text
+the card's time by list (timing run), per frame, from sending to the signal: 137.1 ms
+in 308 lists; the title's 120.1 ms in 218 (their noted commands 88.4, the rest 31.7:
+what of ours is recorded among them, barriers, and the sending); preludes 11.5 ms in
+74 (refreshes of copies); steps on the card 0.0 ms in 0; compares of copies in the
+card's memory 5.5 ms in 17; others of ours 0.0 ms in 0; the least a list took 56 us
+(17.3 ms a frame at that for every list)
+```
+
+```text
+the card's time by command (timing run), all 1370 kinds together: 86.2 ms a frame;
+by first word: indirect 47.1 ms in 4385, dispatch 28.8 ms in 1340, draw 5.4 ms in 458,
+alias 2.3 ms in 85, mesh 1.8 ms in 312, indexed 0.5 ms in 57, copy 0.3 ms in 26,
+read 0.0 ms in 2
+```
+
+There is no single hot pipeline hiding in there. The heaviest three commands are
+`8.98 ms a frame in 1.0 commands (the longest 15.02 ms): indirect [compute
+776d835da5ffa646]`, `4.57 ms: dispatch [compute 39f0e9aeb156a61c]` and `4.26 ms
+(the longest 13.78): indirect [compute 87df99711607dd60]` -- together 17.8 ms of
+the 86.2, and the other 1,367 kinds make up the rest at 10 to 20 microseconds a
+command. That is 4,385 indirect commands and 1,340 dispatches a frame of genuine
+work, not a translation fault. **The card's time is the title's own work; it is
+not being inflated by anything this tree does.** Of our own 17 ms on the card,
+11.5 is preludes and 5.5 compares; `HostList::prelude` already returns `None`
+when it has no barrier, twin copy or upload to record, so there is no empty
+prelude left to skip.
+
+The rest of the title's 120.1 ms -- 31.7 ms -- is barriers and the sending over
+218 lists, and the count behind it is `907 for the title's barrier groups` waits
+a frame for every earlier shader write. That is the title's own barrier
+structure, translated one for one.
+
+**Two things this run settles about the timing switch itself.** `VICTORY_D3D12_DRED=light`
+turns the marker commands off (`host.rs`, `dred_on` is false for `light` and for
+`faults`), so a timing run under `light` reports `their noted commands 0.0, the
+rest 140.0` and no per-command lines at all -- `gt1` did exactly that, 0 of them.
+Use `VICTORY_D3D12_DRED=1` for a timing run. And `concompare.ps1` was reporting
+one frame per log for months: it assigned its rows to `$a`, and PowerShell is
+case-insensitive, so `$a` was the `[string]$A` path parameter and the array was
+coerced to one string. Both are fixed here; the tables above are the first
+readings that tool has actually produced.
