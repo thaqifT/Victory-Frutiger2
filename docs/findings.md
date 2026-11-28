@@ -1082,3 +1082,135 @@ standing.
 
 Nothing here is a fault in the game: the consequence is a stale dword where the
 title and a shader write the same 32 bytes, invisible unless something reads it.
+
+### The baseline at pure defaults (`base1`)
+
+Every comparison this session has been against a different scene, and the draw
+count swings 400 to 8,300 inside one run. `base1` is the reference the next runs
+measure against: no `-More` at all, the wrapper's own table only, 400 s,
+`-Press 28,40,60,80,100,120`.
+
+| | world (>= 200 draws) |
+|---|---|
+| frames | 60 |
+| median | **206.6 ms, 4.84 fps** |
+| draws, median | 2,908 |
+| preparing | 51.6 ms |
+| copies | 25.1 ms |
+| on the GPU | **98.1 ms** |
+| copying back | 24.1 ms |
+| ms per 1,000 draws | 71.0 |
+
+Peak working set 21,370 MB. Best fps of the run 33 (the menu's cap). No device
+removal, no panic, no `ERROR` line.
+
+Preparing, as its own line splits it:
+
+```text
+preparing per frame, the submitting thread: 7.4 ms asking the write watch
+  (0.6 of them finding what to ask), 0.0 putting the title's bytes under
+  flights' writes, 26.3 in the lists' steps (refreshes 19.1 in 64 flushes of
+  9426, 8465 of them known to copy nothing, 8355 on several threads, 1.2 one
+  at a time in 315 before shader writes; copies and fills 1.9), 3.1 snapshots,
+  6.6 for copies in the card's memory; the checks behind those refreshes
+  9740 spans, 8.4 ms on all threads, 9605.8 MB found clean
+```
+
+and the copies:
+
+```text
+copies per frame: 46.0 submissions; 11486 title copies 6.2 MB; 22429
+  refreshes 18100.2 MB; 589 watches 24.24 ms, 13449.2 MB checked,
+  13381.6 MB unchanged
+```
+
+**Two things this settles.**
+
+1. **The write watch is bigger here than the handoff's frame said** -- 24.24 ms
+   of a 206.6 ms frame (12 %), not 11.29 of 137. It scales with the number of
+   copies, and this scene makes more of them: 589 askings of about 23 MB each,
+   13.4 GB walked to find 0.5 % written.
+2. **The card is idle half the frame, and not idle behind the title.** The
+   card's own clock line:
+
+   ```text
+   nothing of ours queued 77.8 ms (the card about 54% busy by this count),
+   67.1 ms of that while the submitting thread was working (the card idle
+   behind us), the rest while the title had not submitted; the submitting
+   thread stood waiting for the card 93.6 ms
+   ```
+
+   67.1 ms of the card's idle time is inside our own preparing. That is the
+   same statement `hp2` made from the other side (heap pacing held 0.00
+   submissions a frame): our preparing and the card's drawing are in series,
+   and the 40-75 ms of overlap the relay promised is still the biggest single
+   item on the table -- and still unreachable, because the sent-ahead path
+   wedges the card.
+
+The copy-back is 24.1 ms here against the 4.9 ms the handoff's table quotes,
+because that table is `wc3`, which ran the write-combining skip on. At the
+shipped default every byte a shader wrote comes back.
+
+## Where the 98 ms on the card goes (`tim1`)
+
+The baseline left one question open: 98.1 ms a frame on the card against a
+card that is only 54 % busy. The handoff's item 1 asked whether that time is
+ours -- a translation fault in the hot compute dispatches -- or the title's
+own work. `tim1` ran 300 s with `VICTORY_GPU_TIMING=1`, `VICTORY_D3D12_DRED=full`
+and `VICTORY_SHADER_SAVE`, the title reached the world at 68 s and then closed
+itself at 175 s with no panic, no device removal and no breadcrumb.
+
+The timing run prints a block per flush: the card's time per command, in
+milliseconds a frame, over the window the flush covers. Summing the blocks in
+the world phase reproduces the 98 ms the frame line reports, so the
+attribution is complete rather than a sample. Four commands carry 14 ms of it:
+
+```text
+5.4 ms  x1.00  dispatch [compute 39f0e9aeb156a61c]
+3.5 ms  x1.00  indirect [compute 6697dff15287e544]
+2.6 ms  x1.00  indirect [compute bc6ca78d5425c179]
+2.5 ms  x75    alias copy
+```
+
+and the remaining ~84 ms is spread over the title's 2,908 draws at 30 us each,
+with no single draw above 0.55 ms. That distribution is the answer: there is
+no hot command of ours to fix, because our copies are 2.5 ms of the 98.
+
+**The six hottest computes translate tighter than the console.** `tools\shader-audit.ps1`
+beside `victory shader-info --disasm` and `dxc -dumpbin`:
+
+```text
+Shader           Console  Ours Ratio Barriers Phi Loads Calls  Brs Threads Wave Scratch
+9938c251a313fe28    1379  3308   2.4        0  65    12  1090   73 8,8,1
+418f3fdf020b9eda    2142  5125  2.39        0 326    69  1147  294 32,1,1
+deec5fb86d9cc5f3    1116  2598  2.33        0 167    67   627  155 32,1,1
+6697dff15287e544    6352 14517  2.29        0 603   271  4936  317 8,4,1   32
+8b9483919d8d5e99    1332  3041  2.28        0  89    18   960   82 4,4,4
+915ed81ea580a276    3614  8255  2.28        0 366    93  2429  252 8,4,1   32
+cf7a9d328289d2a8    1617  3552   2.2        0  60    11  1163   69 8,8,1
+34fb51b8a0312e82    1416  3042  2.15        0  88    35   935   98 8,4,1
+5cf00dc39042edaf    6177 12682  2.05        0 321   248  3600  394 4,8,1   32
+39f0e9aeb156a61c   74594 15027   0.2        0 546   492  2028 4063 32,1,1  32
+```
+
+Zero group barriers in any of them, so nothing of ours is serialising the
+card. The wave size matches the console's on every one that declares it. The
+one that is five times smaller than the console is the one that costs 5.4 ms:
+`39f0e9aeb156a61c` is 74,594 instructions of straight line on GFX10 -- a fully
+unrolled loop, 333,760 bytes of native Cs, dispatched 920x1x1 for 29,440
+threads over a 448,000-element buffer -- and our DXIL keeps the loop instead,
+4,063 branches and 15,027 instructions. We emit a fifth of the console's code
+and the card still takes 5.4 ms, which is what 15 elements a thread through
+that much arithmetic costs. It is the title's shader doing the title's work.
+
+**What this rules out and what it leaves.** No barrier was added, no loop was
+unrolled into more code than the console had, no load was duplicated into a
+redundant one -- the three faults item 1 was looking for are absent from every
+shader that matters. The 98 ms is the title's own rendering load at 2,908
+draws, and the lever that would hide it is overlap, which is closed.
+
+The preparing side is where our time still is: 51.6 ms, of which 26.3 is the
+lists' steps (19.1 of them refreshes across 64 flushes of 9,426 entries, 8,465
+of those entries known to copy nothing) and 7.4 is asking the write watch.
+9,605.8 MB is walked each frame to find 0.5 % written. That is item 2, and it
+is now the largest thing on the frame that is ours.
