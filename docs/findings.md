@@ -1568,3 +1568,29 @@ checked, 14009.0 MB unchanged`. The watched range grows with the scene, the
 share that changed stays near one per cent, and the cost is the width of the
 ranges. A cut here has to come from asking less often or over less, not from
 asking the same thing fewer times.
+
+### Spreading the asks across the pool does not pay (`sp1`)
+
+`VICTORY_ASK_SPREAD` hands the watches of a frame to `land::each_under`
+instead of the `GUARDS` lock, so that the asks of one flush can be taken by
+several threads rather than serialised behind one lock. It was built, run and
+judged in a single A/B (`sp1`: six phases, alternating off/on, `diag`, world
+from about 200 s), and `phasebudget.ps1` on its log says:
+
+```text
+off: 17 rows, prep 54.1 ms at 2,754 draws  = 19.65 ms prep per 1000 draws
+on : 14 rows, prep 58.3 ms at 2,810 draws  = 20.76 ms prep per 1000 draws
+```
+
+The raw per-phase means are not usable — the world phases ran at 1,442 to
+4,331 draws, and the frame time tracks the draw count far more strongly than
+it tracks the switch. The normalised figure is the one that survives that: prep
+per thousand draws, 19.65 ms off against 20.76 ms on. The spread is 5.6 per
+cent the wrong way, inside the noise of six phases, and there is no reading of
+it that shows a gain. **The switch stays off by default and nothing was shipped
+from it.** The `GUARDS` lock is not the shape of this cost: the asks themselves
+are, and they are 10 to 14 GB of page-table walk a frame.
+
+That closes the last of the "make the asking cheaper" levers on the copy path.
+The two that remain are the ones this file already names: ask less often, or
+ask over less. Neither is a tuning knob; both change what the copy guarantees.
