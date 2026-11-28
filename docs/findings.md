@@ -1481,3 +1481,59 @@ free physical memory and 26.3 GB committed**. The staging buffers already
 answer that on their own -- `texture::let_go_idle` takes its idle threshold
 from `available_physical_ram()`, so a tighter machine gives buffers back
 sooner -- but a browser open beside a run has very little room.
+
+## The card is idle half of every frame: the CPU is what sets the frame time
+
+`budget.ps1` reads the frame line and the card's own clock line together. A
+`diag` run of 300 s with the shipped defaults, the world's frames only:
+
+```text
+ draws  ms/frame   card   prep   back   heap |  card idle
+  5406     224.6  107.8   49.6   24.1    8.3  |      135.4
+  4188     238.2  100.7   48.0   23.4    7.9  |      113.2
+  4029     222.5  107.2   47.0   22.8    7.8  |      131.3
+  2891     226.4   92.5   49.1   22.1    4.1  |      113.4
+  4698     229.9  113.6   55.7   27.5   10.2  |       85.9
+  4315     233.4  116.4   57.6   29.9    4.8  |      113.0
+```
+
+Two things fall out of it, and they change what the next work should be.
+
+**The card works about 100 ms and is idle about 113 ms of a 225 ms frame.** So
+the card is not the limit: `frame ~= card + idle`, and the idle is the CPU
+preparing the next submission after the last one was waited to completion.
+That is the same "added up, not overlapped" finding as the timeline, seen from
+the other side.
+
+**Which means the floor is the card, not 83 ms, and it is about 10 fps.** If
+every millisecond of CPU work between submissions went away the frame would be
+the card's 100 ms. We are at 225. The gap -- some 125 ms a frame -- is CPU work
+we own, and because the card is idle while it runs, **a millisecond cut from
+the CPU side is a millisecond off the frame**, until the idle reaches zero.
+
+That is a different shape from "30 fps needs a rewrite". 30 fps still does: the
+card's own 100 ms cannot be split by us. But the road from 4.4 fps to about 10
+is CPU work, and it is measured.
+
+### Where the CPU time is
+
+The copy statistics line, per frame, from the same run:
+
+```text
+copies per frame: 43.4 submissions; 11477 title copies 6.4 MB;
+20104 refreshes 17851.3 MB, 0 skipped 0.0 MB;
+185 runs 0.0 ms; 0 queries 0.00 ms, moves 31.63 ms, 2.76 MB unmapped;
+3656 page faults; 766 watches 50.87 ms, 13421.8 MB checked,
+13310.8 MB unchanged; 16.5 fallbacks; 447 guard faults;
+```
+
+`766 watches` cost **50.87 ms a frame** and between them cover 13.4 GB of
+address range to find that **13.3 GB of it -- 99.2 % -- is unchanged**. That is
+the largest single CPU item found so far, larger than the copies (`moves`,
+31.63 ms). `GetWriteWatch` walks page tables over the range it is given, so the
+cost is the width of the ranges, not the bytes that changed.
+
+The reason the ranges are so wide is that a flush of 20,104 refreshes takes the
+path that hands every one of them to the threads (host.rs, `flush_all`: the
+inline "nothing new" filter only runs at 256 or fewer). Most of those 20,104
+are no-ops; they are being told so one range at a time, through the kernel.

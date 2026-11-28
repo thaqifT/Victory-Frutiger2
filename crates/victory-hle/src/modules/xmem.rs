@@ -1726,17 +1726,39 @@ mod pool {
         more: Condvar,
     }
 
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+
     fn pool() -> &'static Pool {
-        static POOL: OnceLock<Pool> = OnceLock::new();
-        static STARTED: std::sync::Once = std::sync::Once::new();
         let pool = POOL.get_or_init(|| Pool { batches: Mutex::default(), more: Condvar::new() });
         STARTED.call_once(|| {
-            let started = (1..super::asked_threads().unwrap_or(super::WIDE).max(side_by_side()))
+            // Built once, so built for the most threads it can be asked for:
+            // `VICTORY_AB` turns `VICTORY_MAP_THREADS` on and off mid-run, and
+            // a pool built in the off phase would have none to wake in the on
+            // one (`asked_threads` is the environment's number and does not
+            // move).
+            let base = super::asked_threads().unwrap_or(super::WIDE).max(side_by_side());
+            #[cfg(all(windows, feature = "diagnostics"))]
+            let wanted = if victory_gpu::switched("VICTORY_MAP_THREADS").is_some() {
+                base.max(8)
+            } else {
+                base
+            };
+            #[cfg(not(all(windows, feature = "diagnostics")))]
+            let wanted = base;
+            let started = (1..wanted)
                 .filter(|i| std::thread::Builder::new().name(format!("mapping {i}")).spawn(|| serve(pool)).is_ok())
                 .count();
             tracing::info!(started, "threads that map pages side by side (VICTORY_MAP_THREADS=1: none)");
         });
         pool
+    }
+
+    /// Batches still in the queue; a test asks, so that one left behind is
+    /// seen rather than remembered.
+    #[cfg(test)]
+    pub(super) fn queued() -> usize {
+        POOL.get().map_or(0, |p| p.batches.lock().unwrap_or_else(|e| e.into_inner()).len())
     }
 
     fn serve(pool: &Pool) {
@@ -1747,17 +1769,18 @@ mod pool {
         unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
         let mut batches = pool.batches.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            let Some(batch) = batches.front().cloned() else {
+            // The first batch with work left. `all` takes its own back out
+            // when it is done, so nothing is popped here: a batch whose ops
+            // have all begun is skipped over, not removed, and the queue is
+            // the caller's alone to keep.
+            let front = batches
+                .iter()
+                .find(|b| b.next.load(Ordering::Relaxed) < b.ops.len())
+                .cloned();
+            let Some(batch) = front else {
                 batches = pool.more.wait(batches).unwrap_or_else(|e| e.into_inner());
                 continue;
             };
-            if batch.next.load(Ordering::Relaxed) >= batch.ops.len() {
-                // All begun: nobody needs to see it any more.
-                if batches.front().is_some_and(|b| Arc::ptr_eq(b, &batch)) {
-                    batches.pop_front();
-                }
-                continue;
-            }
             drop(batches);
             batch.work();
             batches = pool.batches.lock().unwrap_or_else(|e| e.into_inner());
@@ -1785,10 +1808,13 @@ mod pool {
         });
         let pool = pool();
         pool.batches.lock().unwrap_or_else(|e| e.into_inner()).push_back(batch.clone());
-        if n > side_by_side() {
-            pool.more.notify_all();
-        } else {
-            (1..n).for_each(|_| pool.more.notify_one());
+        let side = side_by_side();
+        if side > 1 {
+            if n > side {
+                pool.more.notify_all();
+            } else {
+                (1..n).for_each(|_| pool.more.notify_one());
+            }
         }
         batch.work();
         let mut over = batch.over.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -1796,6 +1822,16 @@ mod pool {
             over = batch.over.1.wait(over).unwrap_or_else(|e| e.into_inner());
         }
         drop(over);
+        // Taken back out here. Only `serve` pops a batch, and with no thread
+        // beside (`VICTORY_MAP_THREADS=1`, the shipped default) there is no
+        // `serve`: one left behind per change would grow the queue for the
+        // whole run. A worker that still holds its `Arc` finishes on it.
+        {
+            let mut batches = pool.batches.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = batches.iter().position(|b| Arc::ptr_eq(b, &batch)) {
+                batches.remove(at);
+            }
+        }
         // No worker changes it any more (one may still hold it for a moment).
         batch
             .ops
@@ -1805,6 +1841,31 @@ mod pool {
                 (op, done.load(Ordering::Acquire))
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A page with no view and no slice: `run` makes no call at all.
+        fn bare(at: usize) -> Op {
+            Op { at, slice: None, had: false, own: false }
+        }
+
+        #[test]
+        fn a_batch_is_taken_back_out_of_the_queue() {
+            // Three is the shortest batch that goes through the queue rather
+            // than being run where it stands.
+            let done = all(vec![bare(0x1000), bare(0x2000), bare(0x3000)]);
+            assert_eq!(done.len(), 3);
+            assert!(done.iter().all(|(_, ok)| *ok), "no call was made, so all were done");
+            assert_eq!(
+                queued(),
+                0,
+                "a batch left in the queue is never popped when no thread stands beside \
+                 (`VICTORY_MAP_THREADS=1`), so one per change would grow it for the run"
+            );
+        }
     }
 }
 
