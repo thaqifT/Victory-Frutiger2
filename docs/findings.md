@@ -1913,3 +1913,42 @@ case the walk then discovers for itself at one iteration per 64 KiB page.
 `SKIPPED` counts the ranges and bytes it skips, printed as
 `refreshes skipped whole per frame` when it fires, so the next run says
 whether this tail is worth anything.
+
+### Measured: the skip fires, and the tail is small
+
+`skip1` (diag, 230 s, world, 42 frame lines, 3,018-5,702 draws):
+
+```
+refreshes skipped whole per frame: 134 ranges, 38.5 MB of them
+refreshes skipped whole per frame: 121 ranges, 31.4 MB of them
+refreshes skipped whole per frame: 120 ranges, 4.9 MB of them
+refreshes skipped whole per frame: 127 ranges, 5.2 MB of them
+```
+
+So it fires on 120-134 ranges a frame, and those ranges are 5-50 MB of the
+16.8 GB the same run declares. **The walk was never the cost.** It is
+correct and it is free, and it stays, but it is not where the refresh goes.
+
+Where the refresh goes, in the world, from the same run:
+
+| fps | frame | prep | of it copies | tex | GPU | back | draws |
+|---|---|---|---|---|---|---|---|
+| 2.6 | 387.5 | 58.2 | 31.1 ms / 112.2 MB | 3.1 | 101.1 | 21.1 ms / 5.5 MB | 5252 |
+| 4.0 | 249.7 | 49.8 | 22.9 ms / 119.6 MB | 1.0 | 106.0 | 31.9 ms / 20.8 MB | 5702 |
+| 4.8 | 206.3 | 46.0 | 20.1 ms / 102.0 MB | 0.8 | 104.0 | 32.1 ms / 20.7 MB | 4075 |
+| 5.2 | 192.9 | 50.2 | 25.3 ms / 103.5 MB | 1.0 | 93.4 | 29.7 ms / 19.2 MB | 3018 |
+
+The refresh copies **102-120 MB of title memory a frame** at about 4.5 GB/s,
+and that is real changed bytes, not bookkeeping (`12,580 MB unchanged` of
+`12,677 MB checked` in the same run -- the 97 MB that changed is what moves).
+The copy back writes 19-21 MB in 30 ms, which is **0.67 GB/s: the worst rate
+in the frame and the second largest single cost on the submitting thread.**
+
+That rate is the next question worth a run. A copy back is `put_changed` over
+each piece, and a store into write-watched title memory takes a guard fault
+(`597 guard faults` a frame, `347` in the shorter window). At 15-40 us a
+fault that is 9-24 ms of the 30 -- so the cost is the faults, not the bytes,
+and the lever would be to un-protect a piece's blocks in bulk before storing
+instead of one block at a time. That touches `GUARDS`, which is the one thing
+in this tree that has been left alone on purpose; it needs its own run and its
+own care, not a tail-end change.
