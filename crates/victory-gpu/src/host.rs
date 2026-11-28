@@ -11191,10 +11191,21 @@ mod refresh_tests {
                             for at in (from..to).filter(|at| (c.start - region + at) % 32 == 4 * c.class) {
                                 // (The next fetch may have brought more.)
                                 let got = dword(c.start - region + at).load(Ordering::Relaxed);
+                                let word = |b: &[u8]| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+                                // SAFETY: the copy's CPU side, of the copy's length.
+                                let held = word(unsafe { std::slice::from_raw_parts(c.data as *const u8, c.len) });
                                 assert!(
                                     got >= value,
-                                    "not landed: expected at least {value} at offset {at:#x} (class {}), found {got}",
-                                    c.class
+                                    "not landed: expected at least {value} at offset {at:#x} (class {class}), found {got}; \
+                                     the fetch held {fetched}, the CPU's side {held}; \
+                                     now noted to go up {dirty:?}, taken by later sends {later:?}; \
+                                     landings so far left out {skipped} bytes for the title's own and {sent} for a later send",
+                                    class = c.class,
+                                    fetched = word(&now),
+                                    dirty = c.shadow.skip_of(after, at, at + 4).0,
+                                    later = c.shadow.skip_of(after, at, at + 4).1,
+                                    skipped = crate::land::stat_of(crate::land::stat::SKIP_DIRTY),
+                                    sent = crate::land::stat_of(crate::land::stat::SKIP_SENT)
                                 );
                             }
                         }

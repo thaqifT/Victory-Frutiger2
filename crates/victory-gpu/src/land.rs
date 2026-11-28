@@ -115,13 +115,23 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    pub(crate) const COUNT: usize = 26;
+    /// Bytes of a landing left out, by what left them out: the title's own
+    /// bytes not sent up yet, and bytes a send after the fetch took.
+    pub(crate) const SKIP_DIRTY: usize = 26;
+    pub(crate) const SKIP_SENT: usize = 27;
+    pub(crate) const COUNT: usize = 28;
 }
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
 
 pub(crate) fn count(which: usize, n: u64) {
     STATS[which].fetch_add(n, Ordering::Relaxed);
+}
+
+/// One counter as it stands (`crate::land::stat`), for tests that need to
+/// say what a landing left out.
+pub(crate) fn stat_of(which: usize) -> u64 {
+    STATS[which].load(Ordering::Relaxed)
 }
 
 /// Adds the microseconds since `from` to `which`; now.

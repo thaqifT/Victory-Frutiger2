@@ -2826,8 +2826,9 @@ fn by_parts(runs: Vec<(usize, usize, bool)>, pages: &[(usize, u64)], parts: &[u1
 mod landing_tests {
     use super::{KERNEL_PAGE, Shadow};
 
-    /// A page that only a landing wrote is not sent up again; one the title
-    /// wrote too is, and so is every page no landing was noted in.
+    /// A page that only a landing wrote is not sent up again; of one the
+    /// title wrote too only the bytes it wrote are, and every page no
+    /// landing was noted in.
     #[test]
     fn what_a_landing_wrote_is_not_sent_up_again() {
         const PAGES: usize = 6;
@@ -2849,7 +2850,10 @@ mod landing_tests {
         let mut dirty = copy.take_dirty();
         dirty.sort_unstable();
         let part = |a: usize, b: usize| (a * KERNEL_PAGE, b * KERNEL_PAGE);
-        assert_eq!(super::joined(dirty), [part(0, 1), part(2, 3), part(4, 6)]);
+        // Page 2 holds the title's one byte, and only that goes up: marking
+        // the whole 64 KiB held every landing of the block out of the rest
+        // of it, and what a shader wrote there never reached title memory.
+        assert_eq!(super::joined(dirty), [part(0, 1), (2 * KERNEL_PAGE + 9, 2 * KERNEL_PAGE + 10), part(4, 6)]);
         assert_eq!(side[2 * KERNEL_PAGE + 9], 8);
         // Looked at: from here on as any other.
         let (from, to) = page(1, 2);
@@ -3700,6 +3704,16 @@ impl Shadow {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
+    /// The lock a landing merges under, when title memory `[from, to)` is a
+    /// range a flight's shaders may be writing: what the card wrote goes into
+    /// title memory and into the copy's CPU side under it, and a refresh that
+    /// read title memory before the landing and wrote the CPU's side after it
+    /// would put back the bytes from before the card's, which the next send
+    /// would then put over the card's.
+    fn merging_under(&self, from: usize, to: usize) -> Option<std::sync::RwLockWriteGuard<'_, ()>> {
+        self.writes_pending_in(from, to).then(|| self.merging.write().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
     /// title bytes behind: a range shaders may be writing holds a page the
     /// title wrote since the copy last took it. The answer comes from the
@@ -4381,12 +4395,16 @@ impl Shadow {
                 at = next;
             }
         }
-        TITLE.with_borrow_mut(|title| {
-            for (from, to, noted) in runs {
-                if !noted {
-                    self.copy(from, to);
-                    continue;
-                }
+        for (from, to, noted) in runs {
+            if !noted {
+                self.copy(from, to);
+                continue;
+            }
+            // A page a flight's shaders may be writing: what they wrote goes
+            // into the CPU's side under this lock, and a read of title memory
+            // from before it must not be put in after it.
+            let _merging = self.merging_under(from, to);
+            TITLE.with_borrow_mut(|title| {
                 title.resize(to - from, 0);
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
@@ -4402,14 +4420,22 @@ impl Shadow {
                         ECHO[0].fetch_add((next - at) as u64, Ordering::Relaxed);
                     } else {
                         ECHO[1].fetch_add((next - at) as u64, Ordering::Relaxed);
+                        // Only the bytes that differ are the title's own. A
+                        // whole 64 KiB marked for one dword of it holds every
+                        // landing of the block out of everything else in it,
+                        // and what a shader wrote there never reaches title
+                        // memory.
+                        let runs = changed_runs(title, held);
                         held.copy_from_slice(title);
                         self.changed(at - start, next - start);
-                        self.card_changed(at - start, next - start);
+                        self.card_changed_runs(
+                            runs.into_iter().map(|(r, m)| (at - start + r, at - start + r + m)),
+                        );
                     }
                     at = next;
                 }
-            }
-        });
+            });
+        }
         to - from
     }
 
@@ -4427,6 +4453,10 @@ impl Shadow {
             return self.copy(from, to);
         };
         let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        // As in `copy_under_writes`: the landing of a flight that writes this
+        // range merges under this lock, and this read of title memory must
+        // not go into the CPU's side after it.
+        let _merging = self.merging_under(from, to);
         let start = self.start as usize;
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
@@ -4467,6 +4497,14 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        // A range a flight's shaders may be writing: only the bytes the
+        // title's side changed may go up (see [`Shadow::copy_under_writes`]).
+        if self.card.is_some() && !crate::host::upcheck::on() && self.writes_pending_in(from, to) {
+            return self.copy_under_writes(from, to);
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         if self.card.is_some() && from < to && crate::host::upcheck::on() {
@@ -4482,6 +4520,43 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        to - from
+    }
+
+    /// [`Shadow::copy`] of `[from, to)`, which shaders of a flight in the air
+    /// may be writing: page by page, only the bytes title memory changed
+    /// since the copy took them are put in and noted to go up. Noting the
+    /// page whole sent the CPU's side over what those shaders wrote before
+    /// the fetch, and the landing found nothing of theirs to take.
+    fn copy_under_writes(&self, from: usize, to: usize) -> usize {
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        // The landing of a flight that writes this range merges under this
+        // lock; a read of title memory from before it must not go in after.
+        let _merging = self.merging_under(from, to);
+        let start = self.start as usize;
+        TITLE.with_borrow_mut(|title| {
+            let mut at = from;
+            while at < to {
+                let n = (PAGE - at % PAGE).min(to - at);
+                title.resize(n, 0);
+                // (Pages that are not there read as zeros.)
+                crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
+                // SAFETY: inside the mapping of the copy's CPU side, which
+                // nothing else reads or writes there: no part of a refresh
+                // lies over another, and the card copies from it, not into it.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
+                let runs = dword_runs(at, held, title, 0);
+                for &(a, len) in &runs {
+                    held[a..a + len].copy_from_slice(&title[a..a + len]);
+                }
+                self.card_changed_runs(runs.into_iter().map(|(a, len)| (at - start + a, at - start + a + len)));
+                at += n;
+            }
+        });
+        // After the bytes are in: a snapshot taken meanwhile is not current.
+        self.changed(from - start, to - start);
         to - from
     }
 
@@ -4533,6 +4608,23 @@ impl Shadow {
     /// Whether shaders were ever declared to write it.
     pub(crate) fn written(&self) -> bool {
         self.written.load(Ordering::Relaxed)
+    }
+
+    /// Diagnostics (tests): what [`Shadow::land_card`] would leave out of
+    /// `[from, to)` with a fetch after send `fetched_after`, and why: the
+    /// runs the CPU's side has changed and not sent up, and those a later
+    /// send took.
+    #[cfg(test)]
+    pub(crate) fn skip_of(&self, fetched_after: u64, from: usize, to: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+        let Some(card) = &self.card else {
+            return (Vec::new(), Vec::new());
+        };
+        let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+        let held: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+        let mut later = Vec::new();
+        sent.near(fetched_after, from, to, &mut later);
+        (held, later)
     }
 
     /// `bytes` were put into title memory at `address`, and the submission
@@ -4887,7 +4979,11 @@ impl Shadow {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+            let held: usize = skip.iter().map(|&(a, b)| b.min(to) - a.max(from)).sum();
             sent.near(fetched_after, from, to, &mut skip);
+            let all: usize = skip.iter().map(|&(a, b)| b.min(to) - a.max(from)).sum();
+            crate::land::count(crate::land::stat::SKIP_DIRTY, held as u64);
+            crate::land::count(crate::land::stat::SKIP_SENT, all.saturating_sub(held) as u64);
             skip
         };
         let mut put = 0;
