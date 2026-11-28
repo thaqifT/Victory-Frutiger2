@@ -1047,15 +1047,24 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
 /// milliseconds.
 static MAPPING: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
 
+/// Mapping calls that asked for exactly the pages already there, so changed
+/// nothing and never began a change of mapping ([`XMemMapPhysicalPages`]):
+/// how many, and how many pages they named. Counted always, not only while
+/// the streaming log is on: whether the title re-maps the same pages as
+/// often as `map`'s comment says is the whole question here.
+static SKIPPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 pub(crate) fn map_costs() -> Option<String> {
     let n: [u64; 15] = std::array::from_fn(|i| MAPPING[i].swap(0, Ordering::Relaxed));
+    let skipped: [u64; 2] = std::array::from_fn(|i| SKIPPED[i].swap(0, Ordering::Relaxed));
     let time = |i: usize| matches!(i, 2 | 3 | 4 | 6 | 8 | 10 | 12 | 14);
-    (n[0] + n[5] > 0).then(|| {
+    (n[0] + n[5] + skipped[0] > 0).then(|| {
         let all: Vec<String> = n
             .iter()
             .enumerate()
             .map(|(i, &n)| if time(i) { n / 1_000_000 } else { n })
             .map(|n| n.to_string())
+            .chain(skipped.iter().map(|n| n.to_string()))
             .collect();
         all.join("\t")
     })
@@ -1280,6 +1289,33 @@ pub extern "system" fn XMemMapPhysicalPages(
     if let Some(costed) = &mut costed {
         costed.waited = costed.started.elapsed().as_nanos() as u64;
     }
+    // Already showing exactly these slices: unmapping and mapping again
+    // would put back what is there, one `UnmapViewOfFile2` and one
+    // `MapViewOfFile3` per view, each taking the address space's lock. The
+    // title maps the same pages again and again while it streams.
+    //
+    // Asked before the change of mapping is begun, not after: a change
+    // shuts [`victory_gpu::title_memory_reading`] against every in-place
+    // read on every thread for as long as it takes, and a call that changes
+    // nothing has no reason to. `PHYSICAL` is held from before the question
+    // to after the mapping below, so no other call can change what is there
+    // in between.
+    if let Some(pages) = &pages {
+        let table = page_table();
+        let same = pages.iter().enumerate().all(|(i, page)| {
+            match (table.pages.get(page), physical.slice_at(base + i * PAGE)) {
+                (Some(want), Some(have)) => {
+                    want.index == have.index && Arc::ptr_eq(&want.section, &have.section)
+                }
+                _ => false,
+            }
+        });
+        if same {
+            SKIPPED[0].fetch_add(1, Ordering::Relaxed);
+            SKIPPED[1].fetch_add(n as u64, Ordering::Relaxed);
+            return address;
+        }
+    }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
@@ -1293,16 +1329,6 @@ pub extern "system" fn XMemMapPhysicalPages(
         let table = page_table();
         pages.iter().map(|page| table.pages.get(page).cloned()).collect()
     };
-    // Already showing exactly these slices: unmapping and mapping again
-    // would put back what is there, one `UnmapViewOfFile2` and one
-    // `MapViewOfFile3` per view, each taking the address space's lock. The
-    // title maps the same pages again and again while it streams.
-    if slices.iter().enumerate().all(|(i, want)| match (want, physical.slice_at(base + i * PAGE)) {
-        (Some(want), Some(have)) => want.index == have.index && Arc::ptr_eq(&want.section, &have.section),
-        _ => false,
-    }) {
-        return address;
-    }
     unmap(&mut physical, base, n * PAGE);
     let mut i = 0;
     while i < n {

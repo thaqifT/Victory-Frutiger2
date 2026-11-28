@@ -1744,3 +1744,86 @@ which dwords differ; it stores 60 % of that. `safecopy::merge` already does the
 other thing -- reads 32 bytes at a time and only where `now != held` -- which is
 what the relay path would have used. That is the next lever to try, behind a
 switch, A/B'd on `prep`/`back` at matched draw counts.
+## The remapping lock is not the frame: 5,000 page maps a second, none of them repeats
+
+`tl1` put `the title's XMemMapPhysicalPages` at 110.16 ms in 143.7 calls a
+frame and it looked like the biggest single thing in the frame. It is not.
+That thread (`11384`) ran 27.9 ms of the 111.2 ms frame and waited 1.1 ms --
+it is the title's streaming thread, doing its own work behind the frame, and
+its wall time is spent inside the kernel, not in anything of ours.
+
+The tempting story was that `title_memory_remapping` holds the `MAPPING`
+write lock across the whole unmap-and-map (`xmem.rs:1287`), so every in-place
+reader on every thread (`texback.rs:117`, `draw.rs:3845`) is shut out for
+most of the frame. `map`'s own comment says the title maps the same pages
+again and again while it streams, so the fix would be to ask "are these
+exactly the pages already there?" *before* taking the write lock, and return
+without a change of mapping when they are.
+
+That is now in the tree -- the question moved above `title_memory_remapping`,
+`PHYSICAL` still held from before it to after the mapping, and `SKIPPED`
+counts the calls that found nothing to do. `mskip` (diag, 175 s, world) says
+what the answer is:
+
+```text
+calls total 246959  pages 349689  ms 14979
+skipped calls 5092  skipped pages 25
+calls   571  pages   571  ms    12  skipped     0
+calls  5175  pages  5175  ms    60  skipped     0
+calls  5824  pages  5824  ms    83  skipped     0
+calls  7191  pages  7191  ms    97  skipped     0
+calls  4999  pages  4999  ms    73  skipped     0
+```
+
+**In the world the no-op rate is zero.** Calls equal pages to the digit: the
+title maps *one page per call* and it is never the page already there. The
+4,960 skips in the whole run are the load screens, where it does re-map the
+same pages. So the comment in `map` describes the menu, not the streamer, and
+hoisting the check buys nothing in the world.
+
+The rate is also the answer to the size of the problem. 5,000 calls a second
+at one page each cost 85 ms a second of wall time -- 17 us a call, 8.5 per
+cent of one core, and about 9 ms of a 111 ms frame at 9 fps. Real, but not the
+frame. The 110 ms `tl1` showed is that same work inflated by the timeline
+recorder itself (175,284 events) and by contention that only exists while it
+records. **Whatever the `MAPPING` write lock is doing to readers, the whole
+mapping path is 8.5 per cent of one core, so the lock cannot be worth more
+than that.** (An `SRWLOCK` wait is a kernel block the recorder does not name,
+so `tl1`'s silence about it is not proof either way -- the 85 ms a second is
+the direct measurement, and it settles the ceiling.)
+
+The hoist stays: it is correct, it costs one comparison, and `SKIPPED` is now
+in the `M` line of the streaming log (`VICTORY_DSTORAGE_LOG`, two fields
+appended after the fifteen -- nothing parses them positionally) so the next
+person does not have to run this experiment again.
+
+## Where the frame actually goes, banded by draw count
+
+Mining the frame lines of `r1080`, `sx1`, `put2` and `gt2` for the four
+numbers the frame line already carries, grouped by draws, 176 frames:
+
+| draws | n | ms | prep | GPU | back | rest |
+|---|---|---|---|---|---|---|
+| 0 | 55 | 62.5 | 6.9 | 5.1 | 0.7 | 49.7 |
+| 1000 | 22 | 156.7 | 40.2 | 76.9 | 17.5 | 22.1 |
+| 1500 | 37 | 169.5 | 40.9 | 82.4 | 17.5 | 28.7 |
+| 2000 | 11 | 198.9 | 57.6 | 98.8 | 25.6 | 16.9 |
+| 2500 | 11 | 253.4 | 66.6 | 107.2 | 29.5 | 50.0 |
+| 3500 | 7 | 233.9 | 59.2 | 111.1 | 30.5 | 33.0 |
+| 4000 | 4 | 224.8 | 54.4 | 108.4 | 31.2 | 30.8 |
+| 5000 | 4 | 285.3 | 57.0 | 131.3 | 26.3 | 70.8 |
+
+The GPU column is the whole story and it is not ours. It goes 5 ms with an
+empty screen to 77 ms at a thousand draws to 131 ms at five thousand. `gt2`
+already said what is in it: indirect 47.1 ms in 4,385 commands, dispatch
+28.8 in 1,340, draw 5.4 in 458. **The draws are 4 per cent of the card's
+time; the indirect compute is the rest**, and that is the title's own
+meshlet and culling work, not a translation artefact.
+
+So the floor is the card. 30 fps is 33 ms and the card alone is 77 ms at the
+lowest world draw count measured. Nothing on the CPU side of this tree can
+reach it: prep, the round trips and the copy back are 75 ms of a 157 ms frame
+at a thousand draws, and even deleting all of it leaves 82 ms. That is the
+honest number, and it is why every lever tried so far -- overlap, refresh
+cadence, resolution, console profile, buffer sizes, ask spreading -- has
+measured flat or worse.
