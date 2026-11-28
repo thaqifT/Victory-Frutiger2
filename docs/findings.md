@@ -1537,3 +1537,34 @@ The reason the ranges are so wide is that a flush of 20,104 refreshes takes the
 path that hands every one of them to the threads (host.rs, `flush_all`: the
 inline "nothing new" filter only runs at 256 or fewer). Most of those 20,104
 are no-ops; they are being told so one range at a time, through the kernel.
+
+### The refreshes of one flush are not duplicates
+
+The obvious next cut, and it is not there. `flush_all` was given a merge: if
+two refreshes of a flush name the same range of the same shadow, the second is
+the same poll of the same bytes and need not be done. With a counter for what
+it merged, a `diag` run of 210 s in the world reported:
+
+```text
+refreshes of copies per frame: 1.8 flushes, 39 refreshes asked for,
+0 merged into another of the same range of the same shadow
+```
+
+and the same zero in every later line. The 21,176 refreshes a frame are 21,176
+distinct ranges; there is nothing to fold. The merge cost a sort of the list
+and returned nothing, so it is out again.
+
+What the same run says about the size of the problem:
+
+```text
+copies per frame: 27.9 submissions; 8147 title copies 4.9 MB;
+16825 refreshes 13462.0 MB, 0 skipped 0.0 MB;
+moves 29.08 ms; 576 watches 44.86 ms, 10268.8 MB checked,
+10165.5 MB unchanged;
+```
+
+and, on the heaviest frame of the run, `977 watches 94.65 ms, 14206.5 MB
+checked, 14009.0 MB unchanged`. The watched range grows with the scene, the
+share that changed stays near one per cent, and the cost is the width of the
+ranges. A cut here has to come from asking less often or over less, not from
+asking the same thing fewer times.
