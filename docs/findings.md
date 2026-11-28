@@ -1416,3 +1416,68 @@ same span on the chain is 1.67 ms. The 25-56 ms is real CPU, but it is spread
 over the wide threads and lands beside the frame rather than in it. It is not
 the lever the all-threads figure suggests, and the guard work above
 (`VICTORY_TEXTURE_GUARD`, `HASH_EVERY = 8`) is already what keeps it there.
+
+## What the title's own load is worth: two levers, both measured, both no
+
+The frame is CPU-bound (§"The whole frame on a timeline"), so the only levers
+with room were the ones that change what the title itself is asked to draw.
+Two were tried, at shipped defaults on the `release` build, 210 s a run with
+the same press schedule. `res.ps1` reads the frame lines and compares the two
+runs at the same draw count, because the scene is not the same from one run
+to the next and a bare mean is mostly scene.
+
+**`VICTORY_OUTPUT=1280x720` against 1920x1080** (`r1080`, `r720`). Mean over
+the world 205.5 ms against 178.1; the per-bucket changes run from -51 % to
++244 %, which is the scene moving, not the resolution. No signal either way.
+The reason is already known: at 1920x1080 the title's own upscaler renders at
+1280x720, so the output size was never the render size.
+
+**`VICTORY_RENDER_SCALE=0.5`** (`rs05`), which does move the render size: the
+title renders 960x540 and upscales to 1080p. It is **worse everywhere that
+matters** -- mean 233.2 ms against 178.1, best world frame 106.3 ms against
+88.0, and higher in twelve of the fourteen buckets:
+
+```text
+ draws   ms 1920x1080   ms scale 0.5   change
+   500           126.3          243.1     +92%
+  1000           160.7          241.1     +50%
+  1500           149.8          241.8     +61%
+  1750           119.2          203.4     +71%
+  2250           167.1          288.2     +72%
+  3500           213.8          322.0     +51%
+```
+
+A quarter of the pixels and a quarter more time. That is the clearest evidence
+yet that this frame is not pixel-bound at all: the upscale to 1080p costs more
+than the pixels it saves, and the per-draw and per-resource work is unchanged.
+Both levers are closed; graphics settings are not a way into this frame.
+
+## The memory is a plateau, not a leak (`mw`)
+
+`memwatch.ps1` boots the game and reads the process's own counts every five
+seconds from outside. Working set, private commit, and the machine's free
+physical memory:
+
+```text
+   s  work MB  priv MB  free MB
+   5     3567     8691    18351
+  51     5763    10659    15704
+  66    14319    18750     7512
+  97    19788    23532     4090
+ 102    19627    24221     3856
+ 143    18465    24291     4066
+ 184    19183    26309     4080
+ 240    19206    26341     3578
+```
+
+Loading takes the work set from 3.5 GB to 19.8 GB in about 95 s and then it
+**sits**: 18.3-19.2 GB for the remaining 140 s, with no upward trend. Private
+commit steps to 26.3 GB by 184 s and is flat after that. So the 19-23 GB seen
+at the end of `log-fl` and `log-tl` is the title's own world plus our shadows,
+held, not grown -- there is no leak to chase here.
+
+What is left is tight rather than broken: the machine ends with **3.6 GB of
+free physical memory and 26.3 GB committed**. The staging buffers already
+answer that on their own -- `texture::let_go_idle` takes its idle threshold
+from `available_physical_ram()`, so a tighter machine gives buffers back
+sooner -- but a browser open beside a run has very little room.
