@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -10226,6 +10227,9 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            if crate::switch::on("VICTORY_FULLSCREEN") {
+                fullscreen_window(hwnd, width, height);
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -10243,6 +10247,56 @@ impl Host {
                 panel: panel::Panel::new(),
             })
         }
+    }
+}
+
+/// The window the swap chain presents to, made a borderless one covering the
+/// whole of its monitor (`VICTORY_FULLSCREEN=1`).
+///
+/// The driver's frame generation (AMD Fluid Motion Frames) only looks at a
+/// title that covers its display: a windowed 1920x1000 client with a title
+/// bar is refused, and nothing says so. The title's own Alt+Enter cannot get
+/// there either: it changes the style of a window whose swap chain was made
+/// at a fixed size, and the presents that follow stop completing.
+///
+/// The swap chain is left as it was made, so the client area is set to the
+/// swap chain's own size and placed at the monitor's corner: on a monitor of
+/// that size the two agree, and the image is 1:1.
+fn fullscreen_window(hwnd: HWND, width: u32, height: u32) {
+    // SAFETY: window calls on the window we present to, from the thread that
+    // made the swap chain.
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            tracing::warn!("no monitor for the window: left as it was");
+            return;
+        }
+        let screen = info.rcMonitor;
+        let (screen_width, screen_height) = (screen.right - screen.left, screen.bottom - screen.top);
+        // The frame comes off, and the client area is the swap chain's.
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE).0 as isize);
+        let placed = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            screen.left,
+            screen.top,
+            width as i32,
+            height as i32,
+            SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+        );
+        let _ = SetForegroundWindow(hwnd);
+        tracing::info!(
+            width,
+            height,
+            screen_width,
+            screen_height,
+            placed = placed.is_ok(),
+            "the window is borderless (VICTORY_FULLSCREEN): frame generation needs a title that covers its display"
+        );
     }
 }
 
