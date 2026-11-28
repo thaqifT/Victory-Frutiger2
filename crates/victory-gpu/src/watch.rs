@@ -4258,26 +4258,46 @@ mod parts_tests {
     }
 }
 
+/// A fresh allocation of `pages` pages of write-watched memory, at its
+/// address, for the tests that need one; the caller frees it.
+///
+/// [`VIEWS`] and [`PROTECTED`] are keyed by address and outlive the memory
+/// they were noted for: a block that was view memory, or guarded, in one
+/// test, freed, and handed back to another as ordinary committed memory
+/// keeps its bit. [`refused_as_view`] then leaves the range to the guards and
+/// [`writes`] answers `None`, so a test that only wants a range the kernel
+/// will answer about failed whenever its allocation landed on such a block:
+/// `what_is_taken_again_is_what_was_written` failed about one run in four
+/// under the whole suite and never once alone. A fresh allocation is ours
+/// alone, so no live view is at its blocks -- [`is_view`] is asked to say so,
+/// and the bits left by the memory that was here before are cleared.
+#[cfg(test)]
+fn write_watched(pages: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    // SAFETY: a fresh write-watched allocation, freed by the caller.
+    let at = unsafe {
+        VirtualAlloc(std::ptr::null(), pages * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+    } as usize;
+    assert_ne!(at, 0, "{pages} pages of write-watched memory");
+    assert!(!is_view(at, at + pages * PAGE), "a fresh allocation is no view");
+    let (first, last) = (at / BLOCK, (at + pages * PAGE).div_ceil(BLOCK));
+    for block in first..last {
+        PROTECTED.clear(block);
+        VIEWS.clear(block);
+    }
+    at
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-    };
-    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
-        // SAFETY: a fresh write-watched allocation, freed at the end.
-        let p = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                4 * PAGE,
-                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
-                PAGE_READWRITE,
-            )
-        } as usize;
-        assert_ne!(p, 0);
+        // Ours, freed at the end.
+        let p = write_watched(4);
         let (start, end) = (p, p + 4 * PAGE);
         // The journal may hold pages of another test's memory that was here.
         let (none, before) = writes(start, end, false).expect("watched");
@@ -4636,11 +4656,8 @@ mod tests {
     /// copied.
     #[test]
     fn the_rest_of_the_one_asking_has_a_number_of_its_own() {
-        // SAFETY: a fresh write-watched allocation, freed at the end.
-        let p = unsafe {
-            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
-        } as usize;
-        assert_ne!(p, 0);
+        // Ours, freed at the end.
+        let p = write_watched(4);
         // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
         ask_ahead(&ranges);
@@ -5245,16 +5262,31 @@ mod tests {
     /// written since; where they are not known, all of it.
     #[test]
     fn what_is_taken_again_is_what_was_written() {
-        // SAFETY: a fresh write-watched allocation, freed at the end.
-        let p = unsafe {
-            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
-        } as usize;
-        assert_ne!(p, 0);
+        // Ours, freed at the end.
+        let p = write_watched(4);
         let write = |at: usize| {
             // SAFETY: committed pages of ours.
             unsafe { ((p + at) as *mut u8).write_volatile(1) }
         };
-        let tracked = track(p, 4 * PAGE, false).expect("watched");
+        let tracked = match track(p, 4 * PAGE, false) {
+            Some(tracked) => tracked,
+            // Why a fresh write-watched allocation is not watched, named: the
+            // caches are keyed by address and another test's memory was here.
+            None => {
+                let (first, last) = (p / BLOCK, (p + 4 * PAGE).div_ceil(BLOCK));
+                panic!(
+                    "not watched: light {} skip_view_ask {}, refused_as_view {}, protected {:?}, views {:?}, \
+                     published {}, committed {}",
+                    light(),
+                    skip_view_ask(),
+                    refused_as_view(p, p + 4 * PAGE),
+                    PROTECTED.set_in(first, last).collect::<Vec<_>>(),
+                    VIEWS.set_in(first, last).collect::<Vec<_>>(),
+                    published(p, p + 4 * PAGE),
+                    crate::texture::committed(p as *const u8, 4 * PAGE),
+                );
+            }
+        };
         // (Other tests' memory was here.)
         (0..4).for_each(|page| write(page * PAGE + 5));
         assert_eq!(tracked.take(p, p + 4 * PAGE), [(p, p + 4 * PAGE)], "never taken");
@@ -5493,7 +5525,7 @@ mod mapping_tests {
 
 #[cfg(test)]
 mod many_askers_tests {
-    use super::{PAGE, writes};
+    use super::{PAGE, write_watched, writes};
     use windows_sys::Win32::System::Memory::*;
 
     /// Threads that write pages and ask about overlapping ranges at the same
@@ -5501,14 +5533,11 @@ mod many_askers_tests {
     /// its own asking or by one that took the kernel's answer before it).
     #[test]
     fn no_write_is_lost_between_askers() {
-        const MEM_WRITE_WATCH: u32 = 0x20_0000;
         const PAGES: usize = 48;
         const THREADS: usize = 8;
-        // SAFETY: a reservation of our own, freed at the end.
-        let at = unsafe {
-            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
-        } as usize;
-        assert!(at != 0 && at.is_multiple_of(PAGE));
+        // Ours, freed at the end.
+        let at = write_watched(PAGES);
+        assert!(at.is_multiple_of(PAGE));
         std::thread::scope(|s| {
             for t in 0..THREADS {
                 s.spawn(move || {
@@ -6140,15 +6169,12 @@ mod port7_tests {
 
     /// `port`: 1, renderer port #7 on in all threads; 2, in every other.
     fn askers_and_a_submission(port: u8) {
-        const MEM_WRITE_WATCH: u32 = 0x20_0000;
         const PAGES: usize = 48;
         const HALF: usize = PAGES / 2;
         const THREADS: usize = 6;
-        // SAFETY: a reservation of our own, freed at the end.
-        let at = unsafe {
-            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
-        } as usize;
-        assert!(at != 0 && at.is_multiple_of(PAGE));
+        // Ours, freed at the end.
+        let at = write_watched(PAGES);
+        assert!(at.is_multiple_of(PAGE));
         let shared_before = PORT7[P7_SHARED_NOTES].load(Relaxed);
         let skipped_before = PORT7[P7_SKIPPED].load(Relaxed);
         std::thread::scope(|s| {

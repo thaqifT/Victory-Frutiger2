@@ -1288,3 +1288,60 @@ nothing), asking the write watch 5.5, card copies 7.3, snapshots 2.6. On all
 threads beside that, the guards: 15.3 ms waiting for them, 7.5 ms changing
 protections, 736 blocks made read-only. And 8,990 MB is walked by the write
 watch each frame to find 21 MB written.
+
+## A bit keyed by address outlives the memory it was noted for
+
+`watch::tests::what_is_taken_again_is_what_was_written` failed about one run
+in four under the whole suite and never once in thirty runs alone. The panic
+was at `track(p, 4 * PAGE, false).expect("watched")`, and `track` answers
+`None` when `writes` does.
+
+The test now says why instead of guessing, and one run under the suite gave:
+
+```text
+not watched: light true skip_view_ask true, refused_as_view true,
+protected [], views [23078131], published false, committed true
+```
+
+`VIEWS` is a bit per 64 KiB block, keyed by **address**, and it outlives the
+memory it was noted for: the runtime maps a section, the guards note its
+blocks, the section goes, and the address comes back as an ordinary
+`VirtualAlloc` -- with the bit still set. `refused_as_view` then says "view
+memory, the kernel would refuse" and `writes` answers `None` without asking.
+That is fail-closed and it self-heals on the guarded path (`guard` finds it no
+view and clears the bit), so production loses a range's watching for a frame
+or two and copies it whole. The test could not tolerate it at all.
+
+The five tests that need a write-watched range now take one from
+`watch::write_watched(pages)`: it allocates, asks `is_view` to confirm a fresh
+allocation is no view, and clears the `PROTECTED`/`VIEWS` bits of the blocks
+it got -- a true statement, because a fresh allocation is ours alone and no
+live view can be sitting on it.
+
+### What the guard machinery costs, when the lines are read together
+
+`log-landfix`, a steady world frame at 1,321 draws:
+
+```text
+guards 17.9 ms                                    (all threads, per frame)
+waits for the write trackers' locks per frame: ranges held 10 0.96 ms,
+  journal read 109 1.24 ms, journal noted in 52 0.40 ms, guards 259 29.68 ms
+176 view ranges answered block by block; 736 blocks made read-only;
+  235 opened by ourselves; 15.3 ms waiting for the guards,
+  7.5 ms changing protections
+```
+
+So the guard machinery is **47 ms of all-threads time a frame, and 30 of it is
+waiting for its own lock** -- 259 waits at 115 us each. The lock is the
+`GUARDS` write lock (renderer port #6, `VICTORY_PORT_GUARD`, is off), and it is
+held across the `VirtualProtect` work: 736 blocks at ~10 us each is 7.5 ms of
+pure holding a frame, and every title thread that writes a guarded block
+queues behind it. The port-6 claims machinery exists to make that hold short
+and is closed; without it, the wait is the cost, not the walk.
+
+The walk itself is small: 40 MB ranges are 640 blocks, ten words of the
+`clean` set, so the per-word scan is ~1,760 words a frame. The 17.9 ms of
+"guards" is 736 `cover()` calls (each taking `inplace::VIEWS` to find the
+other views of the page) and 736 `VirtualProtect` calls, not a scan over
+gigabytes. The 8,990-12,833 MB that `copystat` reports as "checked" is the
+range the askings cover, not memory that is walked.
