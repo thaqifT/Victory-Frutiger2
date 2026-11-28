@@ -8583,6 +8583,21 @@ fn wide_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
 }
 
+/// Whether a flush's refreshes are spread over the threads beside
+/// (`VICTORY_FLUSH_WIDE`; on, as before). Off, every flush runs on the
+/// submitting thread: the pool costs ~0.2 ms to wake and to wait for
+/// whatever it carries, and the copies of one flush share a handful of
+/// shadows' locks, so the threads end up waiting on those.
+fn flush_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let default_on = || std::env::var_os("VICTORY_FLUSH_WIDE").is_none_or(|v| v != "0");
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_FLUSH_WIDE").unwrap_or_else(default_on);
+    #[cfg(not(feature = "diagnostics"))]
+    let on = default_on();
+    on
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
@@ -8952,8 +8967,17 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
+        // How many a flush holds before the pool beside is worth waking.
+        // Waking it and waiting for it is some 0.2 ms whatever it carries
+        // (four `notify_all`s, a spin and a condvar), and the world's 69
+        // flushes a frame hold some 140 refreshes each: a wash, since the
+        // copies of one flush share a handful of shadows' locks and the
+        // threads wait on those instead of on work. `VICTORY_FLUSH_WIDE=0`
+        // keeps every flush on the submitting thread (`VICTORY_AB` flips
+        // it mid-run).
+        let spread = if flush_wide() { 4 } else { usize::MAX };
         // Renderer port #6: looked at on the threads beside, below.
-        let beside = light && crate::watch::port_guard_plan() && wide_refresh() && self.refreshes.len() >= 4;
+        let beside = light && crate::watch::port_guard_plan() && wide_refresh() && self.refreshes.len() >= spread;
         if light && self.refreshes.len() <= FEW && !beside {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -8977,7 +9001,7 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if wide_refresh() && self.refreshes.len() >= spread {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -9519,13 +9543,30 @@ impl Meter {
     }
 
     /// Record a frame once the swap chain has accepted it.
+    ///
+    /// `DXGI_STATUS_OCCLUDED` — the window is minimised, behind a
+    /// fullscreen one, or the display is asleep — is not a failure: DXGI
+    /// dropped the flip and the frame was drawn all the same. The title
+    /// goes on presenting, so the frame is counted and the line and the
+    /// meters keep their seconds. Run fs1 spent 137 s on a black window
+    /// with the process alive and every frame drawn: this, said as a
+    /// swap chain that "did not present".
     fn record_present(&mut self, hwnd: HWND, status: windows::core::HRESULT) -> bool {
-        use windows::Win32::Foundation::S_OK;
-        if status != S_OK && status != self.last_present {
+        use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, S_OK};
+        if status == DXGI_STATUS_OCCLUDED {
+            if self.last_present != DXGI_STATUS_OCCLUDED {
+                tracing::warn!(
+                    "the window is not on screen (minimised, behind another, or the display asleep): \
+                     DXGI drops the frames until it is; the frames themselves are drawn"
+                );
+            }
+        } else if self.last_present == DXGI_STATUS_OCCLUDED {
+            tracing::info!("the window is on screen again: the frames are shown once more");
+        } else if status != S_OK && status != self.last_present {
             tracing::warn!(?status, "swap chain did not present the frame");
         }
         self.last_present = status;
-        if status != S_OK {
+        if status != S_OK && status != DXGI_STATUS_OCCLUDED {
             return false;
         }
         self.frame(hwnd);
@@ -9794,6 +9835,19 @@ impl Meter {
                 );
                 #[cfg(feature = "diagnostics")]
                 {
+                    {
+                        // Where the heap pass's milliseconds go, which the frame
+                        // line only totals (`heap buffers N passes M ms`). The
+                        // three parts are the sweep of the heap's slots, the
+                        // serial walk that keeps what each slot shows, and the
+                        // uploads of the textures it picks by index.
+                        let [look, set, textures] = [0, 1, 2]
+                            .map(|i| crate::draw::HEAP_SPLIT[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+                        tracing::info!(
+                            "the heap pass per frame: {look:.1} ms looking at the heap's slots, {set:.1} ms \
+                             keeping what each shows, {textures:.1} ms uploading the textures they pick"
+                        );
+                    }
                     let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
                     tracing::info!(
                         "what shaders wrote put into title memory per frame (VICTORY_EXACT_BACK): {:.0} pieces in {:.0} writes, {:.1} MB; {:.0} pieces joined over gaps",
@@ -9888,11 +9942,12 @@ mod present_status_tests {
         let mut meter = Meter::new();
         let hwnd = HWND::default();
         assert!(meter.record_present(hwnd, S_OK));
-        assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
+        // A window nobody can see is still a frame drawn: counted, not failed.
+        assert!(meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
         assert!(!meter.record_present(hwnd, E_FAIL));
         assert!(!meter.record_present(hwnd, E_FAIL));
         assert!(meter.record_present(hwnd, S_OK));
-        assert_eq!(meter.frames, 2);
+        assert_eq!(meter.frames, 3);
         assert_eq!(meter.last_present, S_OK);
     }
 }
