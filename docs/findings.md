@@ -1214,3 +1214,77 @@ lists' steps (19.1 of them refreshes across 64 flushes of 9,426 entries, 8,465
 of those entries known to copy nothing) and 7.4 is asking the write watch.
 9,605.8 MB is walked each frame to find 0.5 % written. That is item 2, and it
 is now the largest thing on the frame that is ours.
+
+## The frame is preparing, then the card, then the copy back -- added up
+
+Four runs at shipped defaults (`base1`, `landfix`, `split1`, `sendchg`; the
+last with `VICTORY_SEND_CHANGED=1`), reading the frame line against the card's
+clock. The three terms the line gives add up to the frame, in every run:
+
+```text
+Run      draws  ms/frame  preparing  GPU   copy back  the three   the rest
+base1     3915     168.1       42.8   90.8       20.6      154.2       13.9
+landfix   1321     134.5       39.8   70.0       18.2      128.0        6.5
+split1    1385     130.7       37.2   71.2       16.7      125.1        5.6
+sendchg   1093     153.6       45.8   82.1       20.1      148.0        5.6
+```
+
+The rest is the present and the title's own frame bookkeeping. What is left
+out of the three is a handful of milliseconds, so **preparing is not hidden
+under the card at all**: a millisecond taken off the lists' steps is a
+millisecond off the frame. The card's clock says the same from the other side:
+
+```text
+base1    nothing of ours queued 77.8 ms (the card 54 % busy), 67.1 ms of it
+         while the submitting thread was working (the card idle behind us);
+         the submitting thread stood waiting for the card 93.6 ms
+landfix  nothing of ours queued 58.0 ms (the card 56 % busy), 53.2 ms of it
+         while the submitting thread was working; waited for the card 74.6 ms
+```
+
+The card is idle 44-46 % of every frame, and half of the frame's idle time is
+spent while we prepare. The handoff's item 1 asked where the 77-98 ms on the
+card goes; the answer stands (the title's own load, `tim1`), but it is not the
+wall on its own: at these draw counts 37-46 ms of the frame is preparation, and
+it is serial with the card rather than under it.
+
+### What the copies are, by size
+
+`VICTORY_COPY_SPLIT=1` splits [`copystat::moved`] into size buckets. At
+defaults, per frame:
+
+```text
+<=64B    544 calls  0.01 ms   0.0 MB
+<=256B  1031 calls  0.01 ms   0.1 MB
+<=1KiB  3380 calls  0.02 ms   1.9 MB
+<=4KiB   509 calls  0.23 ms   1.8 MB
+<=64KiB  879 calls  5.36 ms  27.2 MB
+<=1MiB   203 calls 12.50 ms  46.9 MB
+        6545 calls 18.13 ms  78.0 MB   2,770 ns a call, 4.3 GB/s
+```
+
+The small copies are free: 4,955 calls under 1 KiB cost 0.04 ms between them,
+so the per-call overhead the `VICTORY_JOIN_COPIES` note worried about is not
+there any more. All of the time is bulk movement -- 74 MB in 1,082 calls -- and
+it runs at 3.8-5.1 GB/s, which is what reading cold title memory and writing it
+into the copy costs. There is no overhead left to remove here; the only lever
+is to move fewer bytes.
+
+`VICTORY_SEND_CHANGED=1` (a closed lever, measured again and still left off)
+says how much of those bytes is padding: 54.6 MB compared, 28.2 MB of it found
+as it was, 6.8 MB going up in 116,833 runs. It does halve the movement -- the
+same 78.0 MB, but `moves` fell from 19.39 to 9.95 ms, 7.8 GB/s against 4.3 --
+and it is still a loss, which is why it stays off: the comparing is not free,
+and the frame's own `copies` term went *up*, 18.0 to 26.4 ms, with preparing
+39.8 to 45.8. Reading 54.6 MB to find out that 28.2 MB of it is already there
+costs more than moving the 28.2 MB twice. The bytes are the cost either way;
+there is nothing to be won by looking at them first.
+
+### Where that leaves item 2
+
+At 1,321 draws: preparing 39.8 ms, of which copies 18.0, the lists' steps 21.1
+(refreshes 16.5 across 55 flushes of 5,770 entries, 4,980 of them known to copy
+nothing), asking the write watch 5.5, card copies 7.3, snapshots 2.6. On all
+threads beside that, the guards: 15.3 ms waiting for them, 7.5 ms changing
+protections, 736 blocks made read-only. And 8,990 MB is walked by the write
+watch each frame to find 21 MB written.
